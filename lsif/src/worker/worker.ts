@@ -20,7 +20,7 @@ import { pick } from 'lodash'
 import AsyncPolling from 'async-polling'
 
 /**
- * Runs the worker which accepts LSIF conversion jobs from the work queue.
+ * Runs the worker that converts LSIF uploads.
  *
  * @param logger The logger instance.
  */
@@ -65,8 +65,8 @@ async function main(logger: Logger): Promise<void> {
         const ctx = addTags({ logger, span }, { uploadId: upload.id, ...pick(upload, 'repository', 'commit', 'root') })
 
         await instrument(
-            metrics.jobDurationHistogram,
-            metrics.jobDurationErrorsCounter,
+            metrics.uploadConversionDurationHistogram,
+            metrics.uploadConversionDurationErrorsCounter,
             (): Promise<void> =>
                 logAndTraceCall(ctx, 'Converting upload', (ctx: TracingContext) =>
                     convertUpload(connection, xrepoDatabase, fetchConfiguration, upload, ctx)

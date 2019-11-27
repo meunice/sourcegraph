@@ -27,7 +27,7 @@ import { waitForConfiguration } from '../shared/config/config'
 import { XrepoDatabase } from '../shared/xrepo/xrepo'
 
 /**
- * Runs the HTTP server which accepts LSIF dump uploads and responds to LSIF requests.
+ * Runs the HTTP server that accepts LSIF dump uploads and responds to LSIF requests.
  *
  * @param logger The logger instance.
  */

@@ -36,11 +36,6 @@ export const UPDATE_QUEUE_SIZE_GAUGE_INTERVAL = readEnvInt('UPDATE_QUEUE_SIZE_GA
 export const RESET_STALLED_UPLOADS_INTERVAL = readEnvInt('RESET_STALLED_UPLOADS_INTERVAL', 60)
 
 /**
- * The default page size for the job endpoints.
- */
-export const DEFAULT_JOB_PAGE_SIZE = readEnvInt('DEFAULT_JOB_PAGE_SIZE', 50)
-
-/**
  * The default page size for the upload endpoints.
  */
 export const DEFAULT_UPLOAD_PAGE_SIZE = readEnvInt('DEFAULT_UPLOAD_PAGE_SIZE', 50)
@@ -70,12 +65,7 @@ export const RESULT_CHUNK_CACHE_CAPACITY = readEnvInt('RESULT_CHUNK_CACHE_CAPACI
 /**
  * The maximum age (in seconds) that an upload (completed or queued) will remain in Postgres.
  */
-export const UPLOAD_MAX_AGE = readEnvInt('JOB_UPLOAD_AGE', 60 * 60 * 24 * 7)
-
-/**
- * The maximum age (in seconds) that the files for a failed job can remain on disk.
- */
-export const FAILED_JOB_MAX_AGE = readEnvInt('FAILED_JOB_MAX_AGE', 24 * 60 * 60)
+export const UPLOAD_MAX_AGE = readEnvInt('UPLOAD_UPLOAD_AGE', 60 * 60 * 24 * 7)
 
 /**
  * The maximum age (in seconds) that the files for an unprocessed upload can remain on disk.
