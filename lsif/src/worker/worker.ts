@@ -15,7 +15,7 @@ import { waitForConfiguration } from '../shared/config/config'
 import { XrepoDatabase } from '../shared/xrepo/xrepo'
 import { UploadsManager } from '../shared/uploads/uploads'
 import * as xrepoModels from '../shared/models/xrepo'
-import { convertUpload } from './processors/convert'
+import { convertUpload } from './conversion/conversion'
 import { pick } from 'lodash'
 import AsyncPolling from 'async-polling'
 
