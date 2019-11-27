@@ -9,16 +9,13 @@ import promClient from 'prom-client'
 import { Backend } from './backend/backend'
 import { Connection } from 'typeorm'
 import { createDumpRouter } from './routes/dumps'
-import { createJobRouter } from './routes/jobs'
 import { createLogger } from '../shared/logging'
 import { createLsifRouter } from './routes/lsif'
 import { createMetaRouter } from './routes/meta'
 import { createPostgresConnection } from '../shared/database/postgres'
-import { createQueue, ensureOnlyRepeatableJob } from '../shared/queue/queue'
 import { createTracer } from '../shared/tracing'
 import { dbFilename, dbFilenameOld, ensureDirectory } from '../shared/paths'
 import { default as tracingMiddleware } from 'express-opentracing'
-import { defineRedisCommands } from './redis/redis'
 import { errorHandler } from './middleware/errors'
 import { logger as loggingMiddleware } from 'express-winston'
 import { Logger } from 'winston'
@@ -64,26 +61,6 @@ async function main(logger: Logger): Promise<void> {
     await moveDatabaseFilesToSubdir() // TODO - remove after 3.12
     await ensureFilenamesAreIDs(connection) // TODO - remove after 3.10
 
-    // Create queue to publish convert
-    const queue = createQueue(settings.REDIS_ENDPOINT, logger)
-
-    // Schedule jobs on timers
-    await ensureOnlyRepeatableJob(queue, 'clean-old-jobs', {}, settings.CLEAN_OLD_JOBS_INTERVAL * 1000)
-    await ensureOnlyRepeatableJob(queue, 'clean-failed-jobs', {}, settings.CLEAN_FAILED_JOBS_INTERVAL * 1000)
-
-    // Update queue size metric on a timer
-    setInterval(() => {
-        queue
-            .getJobCountByTypes('waiting')
-            // The type of this method is wrong in the types package: it says that
-            // it returns a counts object, but it really returns a scalar count.
-            .then((count: unknown) => metrics.queueSizeGauge.set(count as number))
-            .catch(() => {})
-    }, 1000)
-
-    // Register the required commands on the queue's Redis client
-    const scriptedClient = await defineRedisCommands(queue.client)
-
     const app = express()
 
     if (tracer !== undefined) {
@@ -104,9 +81,8 @@ async function main(logger: Logger): Promise<void> {
     // Register endpoints
     app.use(createMetaRouter())
     app.use(createDumpRouter(backend))
-    app.use(createJobRouter(queue, scriptedClient, logger, tracer))
     app.use(createUploadRouter(uploadsManager))
-    app.use(createLsifRouter(backend, queue, logger, tracer))
+    app.use(createLsifRouter(backend, uploadsManager, logger, tracer))
 
     // Error handler must be registered last
     app.use(errorHandler(logger))

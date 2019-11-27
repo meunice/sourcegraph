@@ -6,18 +6,6 @@ import { readEnvInt } from '../shared/settings'
 export const HTTP_PORT = readEnvInt('HTTP_PORT', 3186)
 
 /**
- * The host and port running the redis instance containing work queues.
- *
- * Set addresses. Prefer in this order:
- *   - Specific envvar REDIS_STORE_ENDPOINT
- *   - Fallback envvar REDIS_ENDPOINT
- *   - redis-store:6379
- *
- *  Additionally keep this logic in sync with pkg/redispool/redispool.go and cmd/server/redis.go
- */
-export const REDIS_ENDPOINT = process.env.REDIS_STORE_ENDPOINT || process.env.REDIS_ENDPOINT || 'redis-store:6379'
-
-/**
  * Where on the file system to store LSIF files.
  */
 export const STORAGE_ROOT = process.env.LSIF_STORAGE_ROOT || 'lsif-storage'
@@ -46,11 +34,6 @@ export const DEFAULT_JOB_PAGE_SIZE = readEnvInt('DEFAULT_JOB_PAGE_SIZE', 50)
  * The default page size for the upload endpoints.
  */
 export const DEFAULT_UPLOAD_PAGE_SIZE = readEnvInt('DEFAULT_UPLOAD_PAGE_SIZE', 50)
-
-/**
- * The maximum number of jobs to search in one call to the search-jobs.lua script.
- */
-export const MAX_JOB_SEARCH = readEnvInt('MAX_JOB_SEARCH', 10000)
 
 /**
  * The default page size for the dumps endpoint.
