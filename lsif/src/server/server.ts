@@ -13,6 +13,10 @@ import { createLogger } from '../shared/logging'
 import { createLsifRouter } from './routes/lsif'
 import { createMetaRouter } from './routes/meta'
 import { createPostgresConnection } from '../shared/database/postgres'
+<<<<<<< HEAD
+=======
+import { createQueue } from '../shared/queue/queue'
+>>>>>>> lsif-postgres-upload-cleanup
 import { createTracer } from '../shared/tracing'
 import { createUploadRouter } from './routes/uploads'
 import { dbFilename, dbFilenameOld, ensureDirectory } from '../shared/paths'
