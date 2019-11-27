@@ -6,19 +6,14 @@ import { readEnvInt } from '../shared/settings'
 export const WORKER_METRICS_PORT = readEnvInt('WORKER_METRICS_PORT', 3187)
 
 /**
+ * The interval (in seconds) to poll the database for unconverted uploads.
+ */
+export const WORKER_POLLING_INTERVAL = readEnvInt('WORKER_POLLING_INTERVAL', 1)
+
+/**
  * Where on the file system to store LSIF files.
  */
 export const STORAGE_ROOT = process.env.LSIF_STORAGE_ROOT || 'lsif-storage'
-
-/**
- * The maximum age (in seconds) that a job (completed or queued) will remain in redis.
- */
-export const JOB_MAX_AGE = readEnvInt('JOB_MAX_AGE', 60 * 60 * 24 * 7)
-
-/**
- * The maximum age (in seconds) that the files for a failed job can remain on disk.
- */
-export const FAILED_JOB_MAX_AGE = readEnvInt('FAILED_JOB_MAX_AGE', 24 * 60 * 60)
 
 /**
  * The maximum space (in bytes) that the dbs directory can use.

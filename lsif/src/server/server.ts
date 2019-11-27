@@ -14,16 +14,17 @@ import { createLsifRouter } from './routes/lsif'
 import { createMetaRouter } from './routes/meta'
 import { createPostgresConnection } from '../shared/database/postgres'
 import { createTracer } from '../shared/tracing'
+import { createUploadRouter } from './routes/uploads'
 import { dbFilename, dbFilenameOld, ensureDirectory } from '../shared/paths'
 import { default as tracingMiddleware } from 'express-opentracing'
 import { errorHandler } from './middleware/errors'
 import { logger as loggingMiddleware } from 'express-winston'
 import { Logger } from 'winston'
 import { metricsMiddleware } from './middleware/metrics'
+import { startTasks } from './tasks/runner'
+import { UploadsManager } from '../shared/uploads/uploads'
 import { waitForConfiguration } from '../shared/config/config'
 import { XrepoDatabase } from '../shared/xrepo/xrepo'
-import { UploadsManager } from '../shared/uploads/uploads'
-import { createUploadRouter } from './routes/uploads'
 
 /**
  * Runs the HTTP server which accepts LSIF dump uploads and responds to LSIF requests.
@@ -60,6 +61,9 @@ async function main(logger: Logger): Promise<void> {
     // Temporary migrations
     await moveDatabaseFilesToSubdir() // TODO - remove after 3.12
     await ensureFilenamesAreIDs(connection) // TODO - remove after 3.10
+
+    // Start background tasks
+    startTasks(connection, uploadsManager, logger)
 
     const app = express()
 

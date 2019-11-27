@@ -3,6 +3,8 @@ import pRetry from 'p-retry'
 import { Brackets, Connection, EntityManager } from 'typeorm'
 import { FORMAT_TEXT_MAP, Span, Tracer } from 'opentracing'
 import { instrumentQuery, withInstrumentedTransaction } from '../database/postgres'
+import { PlainObjectToDatabaseEntityTransformer } from 'typeorm/query-builder/transformer/PlainObjectToDatabaseEntityTransformer'
+import { Logger } from 'winston'
 
 /**
  * A wrapper around the database tables that control uploads. This class has
@@ -76,12 +78,13 @@ export class UploadsManager {
                 .offset(offset)
 
             if (query) {
+                const clauses = ['repository', 'commit', 'root', 'failure_summary', 'failure_stacktrace'].map(
+                    field => `"${field}" LIKE '%' || :query || '%'`
+                )
+
                 queryBuilder = queryBuilder.andWhere(
                     new Brackets(qb =>
-                        qb
-                            .where("repository LIKE '%' || :query || '%'", { query })
-                            .orWhere("\"commit\" LIKE '%' || :query || '%'", { query })
-                            .orWhere("root LIKE '%' || :query || '%'", { query })
+                        clauses.slice(1).reduce((ob, c) => ob.orWhere(c, { query }), qb.where(clauses[0], { query }))
                     )
                 )
             }
@@ -115,6 +118,50 @@ export class UploadsManager {
     }
 
     /**
+     * Remove all uploads that are older than `maxAge` seconds. Returns the count of deleted uploads.
+     *
+     * @param maxAge The maximum age for an upload.
+     */
+    public async clean(maxAge: number): Promise<number> {
+        return (
+            (
+                await instrumentQuery(() =>
+                    this.connection
+                        .getRepository(xrepoModels.LsifUpload)
+                        .createQueryBuilder()
+                        .delete()
+                        .where("uploaded_at < now() - (:maxAge * interval '1 second')", { maxAge })
+                        .execute()
+                )
+            ).affected || 0
+        )
+    }
+
+    /**
+     * Move all processing uploads started more than `maxAge` seconds ago that are not currently
+     * locked back to the `queued` state.
+     *
+     * @param maxAge The maximum age for an unlocked upload in the `processing` state.
+     */
+    public async resetStalled(maxAge: number): Promise<number[]> {
+        const results: [{ id: number }[]] = await instrumentQuery(() =>
+            this.connection.query(
+                `
+                    UPDATE lsif_uploads u SET state = 'queued', started_at = null WHERE id = ANY(
+                        SELECT id FROM lsif_uploads
+                        WHERE state = 'processing' AND started_at < now() - ($1 * interval '1 second')
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    RETURNING u.id
+                `,
+                [maxAge]
+            )
+        )
+
+        return results[0].map(r => r.id)
+    }
+
+    /**
      * Create a new uploaded with a state of `queued`.
      *
      * @param args The upload payload.
@@ -145,12 +192,12 @@ export class UploadsManager {
             tracer.inject(span, FORMAT_TEXT_MAP, tracing)
         }
 
-        // TODO -need fields for tracer
         const upload = new xrepoModels.LsifUpload()
         upload.repository = repository
         upload.commit = commit
         upload.root = root
         upload.filename = filename
+        upload.tracingContext = JSON.stringify(tracing)
         await instrumentQuery(() => this.connection.createEntityManager().save(upload))
 
         return upload
@@ -171,7 +218,6 @@ export class UploadsManager {
                 this.connection.getRepository(xrepoModels.LsifUpload).findOneOrFail({ id: uploadId })
             )
             if (upload.state === 'errored') {
-                // TODO - test this
                 const error = new Error(upload.failureSummary)
                 error.stack = upload.failureStacktrace
                 throw error
@@ -198,8 +244,12 @@ export class UploadsManager {
      * the error summary and stack trace will be written to the upload record.
      *
      * @param convert The function to call with the locked upload.
+     * @param logger The logger instance.
      */
-    public async dequeueAndConvert(convert: (upload: xrepoModels.LsifUpload) => Promise<void>): Promise<boolean> {
+    public async dequeueAndConvert(
+        convert: (upload: xrepoModels.LsifUpload) => Promise<void>,
+        logger: Logger
+    ): Promise<boolean> {
         // First, we select the next oldest upload with a state of `queued` and set
         // its state to `processing`. We do this outside of a transaction so that this
         // state transition is visible to the API. We skip any locked rows as they are
@@ -219,21 +269,33 @@ export class UploadsManager {
         const uploadId = lockResult[0][0].id
 
         return withInstrumentedTransaction(this.connection, async entityManager => {
-            // TODO - do a few tests with this...
-            const uploads: [
-                xrepoModels.LsifUpload
-            ] = await entityManager.query('SELECT * FROM lsif_uploads WHERE id = $1 FOR UPDATE LIMIT 1', [uploadId])
+            const results: object[] = await entityManager.query(
+                'SELECT * FROM lsif_uploads WHERE id = $1 FOR UPDATE LIMIT 1',
+                [uploadId]
+            )
+            if (results.length === 0) {
+                // Record was deleted in race, retry
+                return this.dequeueAndConvert(convert, logger)
+            }
+
+            // Transform locked result into upload entity
+            const repo = entityManager.getRepository(xrepoModels.LsifUpload)
+            const meta = repo.manager.connection.getMetadata(xrepoModels.LsifUpload)
+            const transformer = new PlainObjectToDatabaseEntityTransformer(repo.manager)
+            const upload = (await transformer.transform(results[0], meta)) as xrepoModels.LsifUpload
 
             let state = 'completed'
             let failureSummary: string | null = null
             let failureStacktrace: string | null = null
 
             try {
-                await convert(uploads[0])
+                await convert(upload)
             } catch (error) {
                 state = 'errored'
-                failureSummary = error && error.message
-                failureStacktrace = error && error.stack
+                failureSummary = error?.message
+                failureStacktrace = error?.stack
+
+                logger.error('Failed to convert upload', { error })
             }
 
             await entityManager.query(
