@@ -5279,10 +5279,15 @@ typescript-json-schema@^0.40.0:
     typescript "^3.5.3"
     yargs "^14.0.0"
 
-typescript@^3.5.3, typescript@^3.7.2:
+typescript@^3.5.3:
   version "3.7.2"
   resolved "https://registry.npmjs.org/typescript/-/typescript-3.7.2.tgz#27e489b95fa5909445e9fef5ee48d81697ad18fb"
   integrity sha512-ml7V7JfiN2Xwvcer+XAf2csGO1bPBdRbFCkYBczNZggrBZ9c7G3riSUeJmqEU5uOtXNPMhE3n+R4FA/3YOAWOQ==
+
+typescript@^3.8.0-dev.20191205:
+  version "3.8.0-dev.20191205"
+  resolved "https://registry.npmjs.org/typescript/-/typescript-3.8.0-dev.20191205.tgz#1a7aeaf793b0d91faf223bbc6789bf35d394d130"
+  integrity sha512-X4oGLJtc2H0zQWg4TnergIJGJYF2eWRLQp1KagBPWSvRtHrsqNLPbR/9oot7V23qr8sZw6FKTOLRbPWcfd5xzg==
 
 uglify-js@^3.1.4:
   version "3.6.0"
