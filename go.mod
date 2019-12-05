@@ -29,7 +29,7 @@ require (
 	github.com/dhui/dktest v0.3.1 // indirect
 	github.com/dnaeon/go-vcr v1.0.1
 	github.com/docker/distribution v2.7.1+incompatible // indirect
-	github.com/docker/docker v0.7.3-0.20190817195342-4760db040282
+	github.com/docker/docker v1.13.1
 	github.com/docker/go-units v0.4.0 // indirect
 	github.com/emersion/go-imap v1.0.1
 	github.com/emersion/go-sasl v0.0.0-20190817083125-240c8404624e // indirect
@@ -68,7 +68,7 @@ require (
 	github.com/gomodule/oauth1 v0.0.0-20181215000758-9a59ed3b0a84
 	github.com/gomodule/redigo v2.0.0+incompatible
 	github.com/google/go-cmp v0.3.1
-	github.com/google/go-github v17.0.0+incompatible
+	github.com/google/go-github/v28 v28.1.1
 	github.com/google/go-github/v28 v28.1.1
 	github.com/google/go-querystring v1.0.0
 	github.com/google/uuid v1.1.1
@@ -108,7 +108,7 @@ require (
 	github.com/lib/pq v1.2.0
 	github.com/lightstep/lightstep-tracer-go v0.18.1
 	github.com/mattn/go-runewidth v0.0.6 // indirect
-	github.com/mattn/go-sqlite3 v1.13.0
+	github.com/mattn/go-sqlite3/v2/v2 v2.0.1
 	github.com/mattn/goreman v0.3.4
 	github.com/mcuadros/go-version v0.0.0-20190830083331-035f6764e8d2
 	github.com/microcosm-cc/bluemonday v1.0.2
@@ -155,7 +155,7 @@ require (
 	github.com/spf13/viper v1.5.0 // indirect
 	github.com/sqs/httpgzip v0.0.0-20180622165210-91da61ed4dff
 	github.com/src-d/enry/v2 v2.1.0
-	github.com/stripe/stripe-go v67.9.0+incompatible
+	github.com/stripe/stripe-go/v68 v68.1.0
 	github.com/temoto/robotstxt v1.1.1
 	github.com/tomnomnom/linkheader v0.0.0-20180905144013-02ca5825eb80
 	github.com/uber/gonduit v0.6.1
@@ -202,8 +202,8 @@ replace (
 	github.com/uber/gonduit => github.com/sourcegraph/gonduit v0.4.0
 )
 
-replace github.com/russross/blackfriday => github.com/russross/blackfriday v1.5.2
+replace github.com/russross/blackfriday/v2 => /v2github.com/russross/blackfriday v2.0.1
 
-replace github.com/dghubble/gologin => github.com/sourcegraph/gologin v1.0.2-0.20181110030308-c6f1b62954d8
+replace github.com/dghubble/gologin => /v2github.com/sourcegraph/gologin/v2 v2.0.0
 
 replace github.com/golang/lint => golang.org/x/lint v0.0.0-20191125180803-fdd1cda4f05f
