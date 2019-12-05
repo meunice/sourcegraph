@@ -29,7 +29,7 @@ require (
 	github.com/dhui/dktest v0.3.1 // indirect
 	github.com/dnaeon/go-vcr v1.0.1
 	github.com/docker/distribution v2.7.1+incompatible // indirect
-	github.com/docker/docker v0.7.3-0.20190817195342-4760db040282
+	github.com/docker/docker v1.13.1
 	github.com/docker/go-units v0.4.0 // indirect
 	github.com/emersion/go-imap v1.0.1
 	github.com/emersion/go-sasl v0.0.0-20190817083125-240c8404624e // indirect
@@ -96,7 +96,7 @@ require (
 	github.com/kardianos/osext v0.0.0-20190222173326-2bc1f35cddc0
 	github.com/karlseguin/expect v1.0.1 // indirect
 	github.com/karlseguin/typed v1.1.7 // indirect
-	github.com/karrick/godirwalk v1.13.0
+	github.com/karrick/godirwalk v1.13.4
 	github.com/karrick/tparse/v2 v2.7.1
 	github.com/keegancsmith/sqlf v1.1.0
 	github.com/keegancsmith/tmpfriend v0.0.0-20180423180255-86e88902a513
@@ -109,7 +109,7 @@ require (
 	github.com/lightstep/lightstep-tracer-go v0.18.1
 	github.com/mattn/go-runewidth v0.0.6 // indirect
 	github.com/mattn/go-sqlite3 v1.13.0
-	github.com/mattn/goreman v0.3.4
+	github.com/mattn/goreman v0.3.5
 	github.com/mcuadros/go-version v0.0.0-20190830083331-035f6764e8d2
 	github.com/microcosm-cc/bluemonday v1.0.2
 	github.com/morikuni/aec v1.0.0 // indirect
@@ -155,7 +155,7 @@ require (
 	github.com/spf13/viper v1.5.0 // indirect
 	github.com/sqs/httpgzip v0.0.0-20180622165210-91da61ed4dff
 	github.com/src-d/enry/v2 v2.1.0
-	github.com/stripe/stripe-go v67.9.0+incompatible
+	github.com/stripe/stripe-go v67.10.0+incompatible
 	github.com/temoto/robotstxt v1.1.1
 	github.com/tomnomnom/linkheader v0.0.0-20180905144013-02ca5825eb80
 	github.com/uber/gonduit v0.6.1
@@ -173,13 +173,13 @@ require (
 	go.uber.org/atomic v1.5.1 // indirect
 	go.uber.org/automaxprocs v1.2.0
 	golang.org/x/arch v0.0.0-20191101135251-a0d8588395bd // indirect
-	golang.org/x/crypto v0.0.0-20191128160524-b544559bb6d1
-	golang.org/x/net v0.0.0-20191126235420-ef20fe5d7933
-	golang.org/x/oauth2 v0.0.0-20191122200657-5d9234df094c
+	golang.org/x/crypto v0.0.0-20191205180655-e7c4368fe9dd
+	golang.org/x/net v0.0.0-20191204025024-5ee1b9f4859a
+	golang.org/x/oauth2 v0.0.0-20191202225959-858c2ad4c8b6
 	golang.org/x/sync v0.0.0-20190911185100-cd5d95a43a6e
-	golang.org/x/sys v0.0.0-20191128015809-6d18c012aee9
+	golang.org/x/sys v0.0.0-20191204072324-ce4227a45e2e
 	golang.org/x/time v0.0.0-20191024005414-555d28b269f0
-	golang.org/x/tools v0.0.0-20191130070609-6e064ea0cf2d
+	golang.org/x/tools v0.0.0-20191205183834-61fa4dffed09
 	golang.org/x/xerrors v0.0.0-20191011141410-1b5146add898 // indirect
 	google.golang.org/appengine v1.6.5 // indirect
 	google.golang.org/genproto v0.0.0-20191115221424-83cc0476cb11 // indirect
