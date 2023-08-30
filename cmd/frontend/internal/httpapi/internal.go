@@ -4,28 +4,32 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"path"
 	"strconv"
 
+	"github.com/cockroachdb/errors"
 	"github.com/gorilla/mux"
 	"github.com/inconshreveable/log15"
-	"github.com/pkg/errors"
+
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/backend"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/globals"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/types"
 	"github.com/sourcegraph/sourcegraph/internal/api"
 	"github.com/sourcegraph/sourcegraph/internal/conf"
-	"github.com/sourcegraph/sourcegraph/internal/db"
+	"github.com/sourcegraph/sourcegraph/internal/database"
+	"github.com/sourcegraph/sourcegraph/internal/database/dbconn"
+	"github.com/sourcegraph/sourcegraph/internal/database/dbutil"
 	"github.com/sourcegraph/sourcegraph/internal/errcode"
 	"github.com/sourcegraph/sourcegraph/internal/gitserver"
 	"github.com/sourcegraph/sourcegraph/internal/gitserver/protocol"
 	"github.com/sourcegraph/sourcegraph/internal/jsonc"
 	searchbackend "github.com/sourcegraph/sourcegraph/internal/search/backend"
 	"github.com/sourcegraph/sourcegraph/internal/txemail"
+	"github.com/sourcegraph/sourcegraph/internal/types"
 	"github.com/sourcegraph/sourcegraph/internal/vcs/git"
+	"github.com/sourcegraph/sourcegraph/schema"
 )
 
 func serveReposGetByName(w http.ResponseWriter, r *http.Request) error {
@@ -43,84 +47,107 @@ func serveReposGetByName(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-func servePhabricatorRepoCreate(w http.ResponseWriter, r *http.Request) error {
-	var repo api.PhabricatorRepoCreateRequest
-	err := json.NewDecoder(r.Body).Decode(&repo)
-	if err != nil {
-		return err
+func servePhabricatorRepoCreate(db dbutil.DB) func(w http.ResponseWriter, r *http.Request) error {
+	return func(w http.ResponseWriter, r *http.Request) error {
+		var repo api.PhabricatorRepoCreateRequest
+		err := json.NewDecoder(r.Body).Decode(&repo)
+		if err != nil {
+			return err
+		}
+		phabRepo, err := database.Phabricator(db).CreateOrUpdate(r.Context(), repo.Callsign, repo.RepoName, repo.URL)
+		if err != nil {
+			return err
+		}
+		data, err := json.Marshal(phabRepo)
+		if err != nil {
+			return err
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(data)
+		return nil
 	}
-	phabRepo, err := db.Phabricator.CreateOrUpdate(r.Context(), repo.Callsign, repo.RepoName, repo.URL)
-	if err != nil {
-		return err
-	}
-	data, err := json.Marshal(phabRepo)
-	if err != nil {
-		return err
-	}
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(data)
-	return nil
 }
 
 // serveExternalServiceConfigs serves a JSON response that is an array of all
 // external service configs that match the requested kind.
-func serveExternalServiceConfigs(w http.ResponseWriter, r *http.Request) error {
-	var req api.ExternalServiceConfigsRequest
-	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
-		return err
-	}
-	services, err := db.ExternalServices.List(r.Context(), db.ExternalServicesListOptions{
-		Kinds: []string{req.Kind},
-	})
-	if err != nil {
-		return err
-	}
-
-	// Instead of returning an intermediate response type, we directly return
-	// the array of configs (which are themselves JSON objects).
-	// This makes it possible for the caller to directly unmarshal the response into
-	// a slice of connection configurations for this external service kind.
-	configs := make([]map[string]interface{}, 0, len(services))
-	for _, service := range services {
-		var config map[string]interface{}
-		// Raw configs may have comments in them so we have to use a json parser
-		// that supports comments in json.
-		if err := jsonc.Unmarshal(service.Config, &config); err != nil {
-			log15.Error(
-				"ignoring external service config that has invalid json",
-				"id", service.ID,
-				"displayName", service.DisplayName,
-				"config", service.Config,
-				"err", err,
-			)
-			continue
+func serveExternalServiceConfigs(db dbutil.DB) func(w http.ResponseWriter, r *http.Request) error {
+	return func(w http.ResponseWriter, r *http.Request) error {
+		var req api.ExternalServiceConfigsRequest
+		err := json.NewDecoder(r.Body).Decode(&req)
+		if err != nil {
+			return err
 		}
-		configs = append(configs, config)
+
+		options := database.ExternalServicesListOptions{
+			Kinds:   []string{req.Kind},
+			AfterID: int64(req.AfterID),
+		}
+		if req.Limit > 0 {
+			options.LimitOffset = &database.LimitOffset{
+				Limit: req.Limit,
+			}
+		}
+
+		services, err := database.ExternalServices(db).List(r.Context(), options)
+		if err != nil {
+			return err
+		}
+
+		// Instead of returning an intermediate response type, we directly return
+		// the array of configs (which are themselves JSON objects).
+		// This makes it possible for the caller to directly unmarshal the response into
+		// a slice of connection configurations for this external service kind.
+		configs := make([]map[string]interface{}, 0, len(services))
+		for _, service := range services {
+			var config map[string]interface{}
+			// Raw configs may have comments in them so we have to use a json parser
+			// that supports comments in json.
+			if err := jsonc.Unmarshal(service.Config, &config); err != nil {
+				log15.Error(
+					"ignoring external service config that has invalid json",
+					"id", service.ID,
+					"displayName", service.DisplayName,
+					"config", service.Config,
+					"err", err,
+				)
+				continue
+			}
+			configs = append(configs, config)
+		}
+		return json.NewEncoder(w).Encode(configs)
 	}
-	return json.NewEncoder(w).Encode(configs)
 }
 
 // serveExternalServicesList serves a JSON response that is an array of all external services
 // of the given kind
-func serveExternalServicesList(w http.ResponseWriter, r *http.Request) error {
-	var req api.ExternalServicesListRequest
-	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
-		return err
-	}
+func serveExternalServicesList(db dbutil.DB) func(w http.ResponseWriter, r *http.Request) error {
+	return func(w http.ResponseWriter, r *http.Request) error {
+		var req api.ExternalServicesListRequest
+		err := json.NewDecoder(r.Body).Decode(&req)
+		if err != nil {
+			return err
+		}
 
-	if len(req.Kinds) == 0 {
-		req.Kinds = append(req.Kinds, req.Kind)
-	}
+		if len(req.Kinds) == 0 {
+			req.Kinds = append(req.Kinds, req.Kind)
+		}
 
-	services, err := db.ExternalServices.List(r.Context(), db.ExternalServicesListOptions{
-		Kinds: req.Kinds,
-	})
-	if err != nil {
-		return err
+		options := database.ExternalServicesListOptions{
+			Kinds:   []string{req.Kind},
+			AfterID: int64(req.AfterID),
+		}
+		if req.Limit > 0 {
+			options.LimitOffset = &database.LimitOffset{
+				Limit: req.Limit,
+			}
+		}
+
+		services, err := database.ExternalServices(db).List(r.Context(), options)
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(w).Encode(services)
 	}
-	return json.NewEncoder(w).Encode(services)
 }
 
 func serveConfiguration(w http.ResponseWriter, r *http.Request) error {
@@ -135,30 +162,80 @@ func serveConfiguration(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
+func repoRankFromConfig(siteConfig schema.SiteConfiguration, repoName string) float64 {
+	val := 0.0
+	if siteConfig.ExperimentalFeatures == nil || siteConfig.ExperimentalFeatures.Ranking == nil {
+		return val
+	}
+	scores := siteConfig.ExperimentalFeatures.Ranking.RepoScores
+	if len(scores) == 0 {
+		return val
+	}
+	// try every "directory" in the repo name to assign it a value, so a repoName like
+	// "github.com/sourcegraph/zoekt" will have "github.com", "github.com/sourcegraph",
+	// and "github.com/sourcegraph/zoekt" tested.
+	for i := 0; i < len(repoName); i++ {
+		if repoName[i] == '/' {
+			val += scores[repoName[:i]]
+		}
+	}
+	val += scores[repoName]
+	return val
+}
+
 // serveSearchConfiguration is _only_ used by the zoekt index server. Zoekt does
 // not depend on frontend and therefore does not have access to `conf.Watch`.
 // Additionally, it only cares about certain search specific settings so this
 // search specific endpoint is used rather than serving the entire site settings
 // from /.internal/configuration.
+//
+// This endpoint also supports batch requests to avoid managing concurrency in
+// zoekt. On vertically scaled instances we have observed zoekt requesting
+// this endpoint concurrently leading to socket starvation.
 func serveSearchConfiguration(w http.ResponseWriter, r *http.Request) error {
-	repo := r.URL.Query().Get("repo")
-	getVersion := func(branch string) (string, error) {
-		// Do not to trigger a repo-updater lookup since this is a batch job.
-		commitID, err := git.ResolveRevision(r.Context(), gitserver.Repo{Name: api.RepoName(repo)}, nil, branch, git.ResolveRevisionOptions{})
-		if err != nil && errcode.HTTP(err) == http.StatusNotFound {
-			// GetIndexOptions wants an empty rev for a missing rev or empty
-			// repo.
-			return "", nil
+	ctx := r.Context()
+	siteConfig := conf.Get().SiteConfiguration
+	getRepoIndexOptions := func(repoName string) (*searchbackend.RepoIndexOptions, error) {
+		repo, err := database.GlobalRepos.GetByName(ctx, api.RepoName(repoName))
+		if err != nil {
+			return nil, err
 		}
-		return string(commitID), err
+
+		getVersion := func(branch string) (string, error) {
+			// Do not to trigger a repo-updater lookup since this is a batch job.
+			commitID, err := git.ResolveRevision(ctx, repo.Name, branch, git.ResolveRevisionOptions{})
+			if err != nil && errcode.HTTP(err) == http.StatusNotFound {
+				// GetIndexOptions wants an empty rev for a missing rev or empty
+				// repo.
+				return "", nil
+			}
+			return string(commitID), err
+		}
+
+		priority := float64(repo.Stars) + repoRankFromConfig(siteConfig, repoName)
+
+		return &searchbackend.RepoIndexOptions{
+			RepoID:     int32(repo.ID),
+			Public:     !repo.Private,
+			Priority:   priority,
+			Fork:       repo.Fork,
+			Archived:   repo.Archived,
+			GetVersion: getVersion,
+		}, nil
 	}
 
-	b, err := searchbackend.GetIndexOptions(&conf.Get().SiteConfiguration, repo, getVersion)
-	if err != nil {
+	sc := database.SearchContexts(dbconn.Global)
+	getSearchContextRevisions := func(repoID int32) ([]string, error) {
+		return sc.GetAllRevisionsForRepo(ctx, repoID)
+	}
+
+	if err := r.ParseForm(); err != nil {
 		return err
 	}
-	_, err = w.Write(b)
-	return err
+
+	b := searchbackend.GetIndexOptions(&siteConfig, getRepoIndexOptions, getSearchContextRevisions, r.Form["repo"]...)
+	_, _ = w.Write(b)
+	return nil
 }
 
 type reposListServer struct {
@@ -168,10 +245,10 @@ type reposListServer struct {
 	// Repos is the subset of backend.Repos methods we use. Declared as an
 	// interface for testing.
 	Repos interface {
-		// ListDefault returns the repositories to index on Sourcegraph.com
-		ListDefault(context.Context) ([]*types.Repo, error)
+		// ListIndexable returns the repositories to index on Sourcegraph.com
+		ListIndexable(context.Context) ([]types.RepoName, error)
 		// List returns a list of repositories
-		List(context.Context, db.ReposListOptions) ([]*types.Repo, error)
+		List(context.Context, database.ReposListOptions) ([]*types.Repo, error)
 	}
 
 	// Indexers is the subset of searchbackend.Indexers methods we
@@ -203,7 +280,7 @@ func (h *reposListServer) serveIndex(w http.ResponseWriter, r *http.Request) err
 
 	var names []string
 	if h.SourcegraphDotComMode {
-		res, err := h.Repos.ListDefault(r.Context())
+		res, err := h.Repos.ListIndexable(r.Context())
 		if err != nil {
 			return errors.Wrap(err, "listing repos")
 		}
@@ -213,7 +290,7 @@ func (h *reposListServer) serveIndex(w http.ResponseWriter, r *http.Request) err
 		}
 	} else {
 		trueP := true
-		res, err := h.Repos.List(r.Context(), db.ReposListOptions{Index: &trueP})
+		res, err := h.Repos.List(r.Context(), database.ReposListOptions{Index: &trueP})
 		if err != nil {
 			return errors.Wrap(err, "listing repos")
 		}
@@ -247,142 +324,156 @@ func (h *reposListServer) serveIndex(w http.ResponseWriter, r *http.Request) err
 }
 
 func serveReposListEnabled(w http.ResponseWriter, r *http.Request) error {
-	names, err := db.Repos.ListEnabledNames(r.Context())
+	names, err := database.GlobalRepos.ListEnabledNames(r.Context())
 	if err != nil {
 		return err
 	}
 	return json.NewEncoder(w).Encode(names)
 }
 
-func serveSavedQueriesListAll(w http.ResponseWriter, r *http.Request) error {
-	// List settings for all users, orgs, etc.
-	settings, err := db.SavedSearches.ListAll(r.Context())
-	if err != nil {
-		return errors.Wrap(err, "db.SavedSearches.ListAll")
-	}
-
-	queries := make([]api.SavedQuerySpecAndConfig, 0, len(settings))
-	for _, s := range settings {
-		var spec api.SavedQueryIDSpec
-		if s.Config.UserID != nil {
-			spec = api.SavedQueryIDSpec{Subject: api.SettingsSubject{User: s.Config.UserID}, Key: s.Config.Key}
-		} else if s.Config.OrgID != nil {
-			spec = api.SavedQueryIDSpec{Subject: api.SettingsSubject{Org: s.Config.OrgID}, Key: s.Config.Key}
+func serveSavedQueriesListAll(db dbutil.DB) func(w http.ResponseWriter, r *http.Request) error {
+	return func(w http.ResponseWriter, r *http.Request) error {
+		// List settings for all users, orgs, etc.
+		settings, err := database.SavedSearches(db).ListAll(r.Context())
+		if err != nil {
+			return errors.Wrap(err, "database.SavedSearches.ListAll")
 		}
 
-		queries = append(queries, api.SavedQuerySpecAndConfig{
-			Spec:   spec,
-			Config: s.Config,
+		queries := make([]api.SavedQuerySpecAndConfig, 0, len(settings))
+		for _, s := range settings {
+			var spec api.SavedQueryIDSpec
+			if s.Config.UserID != nil {
+				spec = api.SavedQueryIDSpec{Subject: api.SettingsSubject{User: s.Config.UserID}, Key: s.Config.Key}
+			} else if s.Config.OrgID != nil {
+				spec = api.SavedQueryIDSpec{Subject: api.SettingsSubject{Org: s.Config.OrgID}, Key: s.Config.Key}
+			}
+
+			queries = append(queries, api.SavedQuerySpecAndConfig{
+				Spec:   spec,
+				Config: s.Config,
+			})
+		}
+
+		if err := json.NewEncoder(w).Encode(queries); err != nil {
+			return errors.Wrap(err, "Encode")
+		}
+
+		return nil
+	}
+}
+
+func serveSavedQueriesGetInfo(db dbutil.DB) func(w http.ResponseWriter, r *http.Request) error {
+	return func(w http.ResponseWriter, r *http.Request) error {
+		var query string
+		err := json.NewDecoder(r.Body).Decode(&query)
+		if err != nil {
+			return errors.Wrap(err, "Decode")
+		}
+		info, err := database.QueryRunnerState(db).Get(r.Context(), query)
+		if err != nil {
+			return errors.Wrap(err, "SavedQueries.Get")
+		}
+		if err := json.NewEncoder(w).Encode(info); err != nil {
+			return errors.Wrap(err, "Encode")
+		}
+		return nil
+	}
+}
+
+func serveSavedQueriesSetInfo(db dbutil.DB) func(w http.ResponseWriter, r *http.Request) error {
+	return func(w http.ResponseWriter, r *http.Request) error {
+		var info *api.SavedQueryInfo
+		err := json.NewDecoder(r.Body).Decode(&info)
+		if err != nil {
+			return errors.Wrap(err, "Decode")
+		}
+		err = database.QueryRunnerState(db).Set(r.Context(), &database.SavedQueryInfo{
+			Query:        info.Query,
+			LastExecuted: info.LastExecuted,
+			LatestResult: info.LatestResult,
+			ExecDuration: info.ExecDuration,
 		})
+		if err != nil {
+			return errors.Wrap(err, "SavedQueries.Set")
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+		return nil
 	}
-
-	if err := json.NewEncoder(w).Encode(queries); err != nil {
-		return errors.Wrap(err, "Encode")
-	}
-
-	return nil
 }
 
-func serveSavedQueriesGetInfo(w http.ResponseWriter, r *http.Request) error {
-	var query string
-	err := json.NewDecoder(r.Body).Decode(&query)
-	if err != nil {
-		return errors.Wrap(err, "Decode")
+func serveSavedQueriesDeleteInfo(db dbutil.DB) func(w http.ResponseWriter, r *http.Request) error {
+	return func(w http.ResponseWriter, r *http.Request) error {
+		var query string
+		err := json.NewDecoder(r.Body).Decode(&query)
+		if err != nil {
+			return errors.Wrap(err, "Decode")
+		}
+		err = database.QueryRunnerState(db).Delete(r.Context(), query)
+		if err != nil {
+			return errors.Wrap(err, "SavedQueries.Delete")
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+		return nil
 	}
-	info, err := db.QueryRunnerState.Get(r.Context(), query)
-	if err != nil {
-		return errors.Wrap(err, "SavedQueries.Get")
-	}
-	if err := json.NewEncoder(w).Encode(info); err != nil {
-		return errors.Wrap(err, "Encode")
-	}
-	return nil
 }
 
-func serveSavedQueriesSetInfo(w http.ResponseWriter, r *http.Request) error {
-	var info *api.SavedQueryInfo
-	err := json.NewDecoder(r.Body).Decode(&info)
-	if err != nil {
-		return errors.Wrap(err, "Decode")
+func serveSettingsGetForSubject(db dbutil.DB) func(w http.ResponseWriter, r *http.Request) error {
+	return func(w http.ResponseWriter, r *http.Request) error {
+		var subject api.SettingsSubject
+		if err := json.NewDecoder(r.Body).Decode(&subject); err != nil {
+			return errors.Wrap(err, "Decode")
+		}
+		settings, err := database.Settings(db).GetLatest(r.Context(), subject)
+		if err != nil {
+			return errors.Wrap(err, "Settings.GetLatest")
+		}
+		if err := json.NewEncoder(w).Encode(settings); err != nil {
+			return errors.Wrap(err, "Encode")
+		}
+		return nil
 	}
-	err = db.QueryRunnerState.Set(r.Context(), &db.SavedQueryInfo{
-		Query:        info.Query,
-		LastExecuted: info.LastExecuted,
-		LatestResult: info.LatestResult,
-		ExecDuration: info.ExecDuration,
-	})
-	if err != nil {
-		return errors.Wrap(err, "SavedQueries.Set")
-	}
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("OK"))
-	return nil
 }
 
-func serveSavedQueriesDeleteInfo(w http.ResponseWriter, r *http.Request) error {
-	var query string
-	err := json.NewDecoder(r.Body).Decode(&query)
-	if err != nil {
-		return errors.Wrap(err, "Decode")
+func serveOrgsListUsers(db dbutil.DB) func(w http.ResponseWriter, r *http.Request) error {
+	return func(w http.ResponseWriter, r *http.Request) error {
+		var orgID int32
+		err := json.NewDecoder(r.Body).Decode(&orgID)
+		if err != nil {
+			return errors.Wrap(err, "Decode")
+		}
+		orgMembers, err := database.OrgMembers(db).GetByOrgID(r.Context(), orgID)
+		if err != nil {
+			return errors.Wrap(err, "OrgMembers.GetByOrgID")
+		}
+		users := make([]int32, 0, len(orgMembers))
+		for _, member := range orgMembers {
+			users = append(users, member.UserID)
+		}
+		if err := json.NewEncoder(w).Encode(users); err != nil {
+			return errors.Wrap(err, "Encode")
+		}
+		return nil
 	}
-	err = db.QueryRunnerState.Delete(r.Context(), query)
-	if err != nil {
-		return errors.Wrap(err, "SavedQueries.Delete")
-	}
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("OK"))
-	return nil
 }
 
-func serveSettingsGetForSubject(w http.ResponseWriter, r *http.Request) error {
-	var subject api.SettingsSubject
-	if err := json.NewDecoder(r.Body).Decode(&subject); err != nil {
-		return errors.Wrap(err, "Decode")
+func serveOrgsGetByName(db dbutil.DB) func(w http.ResponseWriter, r *http.Request) error {
+	return func(w http.ResponseWriter, r *http.Request) error {
+		var orgName string
+		err := json.NewDecoder(r.Body).Decode(&orgName)
+		if err != nil {
+			return errors.Wrap(err, "Decode")
+		}
+		org, err := database.Orgs(db).GetByName(r.Context(), orgName)
+		if err != nil {
+			return errors.Wrap(err, "Orgs.GetByName")
+		}
+		if err := json.NewEncoder(w).Encode(org.ID); err != nil {
+			return errors.Wrap(err, "Encode")
+		}
+		return nil
 	}
-	settings, err := db.Settings.GetLatest(r.Context(), subject)
-	if err != nil {
-		return errors.Wrap(err, "Settings.GetLatest")
-	}
-	if err := json.NewEncoder(w).Encode(settings); err != nil {
-		return errors.Wrap(err, "Encode")
-	}
-	return nil
-}
-
-func serveOrgsListUsers(w http.ResponseWriter, r *http.Request) error {
-	var orgID int32
-	err := json.NewDecoder(r.Body).Decode(&orgID)
-	if err != nil {
-		return errors.Wrap(err, "Decode")
-	}
-	orgMembers, err := db.OrgMembers.GetByOrgID(r.Context(), orgID)
-	if err != nil {
-		return errors.Wrap(err, "OrgMembers.GetByOrgID")
-	}
-	users := make([]int32, 0, len(orgMembers))
-	for _, member := range orgMembers {
-		users = append(users, member.UserID)
-	}
-	if err := json.NewEncoder(w).Encode(users); err != nil {
-		return errors.Wrap(err, "Encode")
-	}
-	return nil
-}
-
-func serveOrgsGetByName(w http.ResponseWriter, r *http.Request) error {
-	var orgName string
-	err := json.NewDecoder(r.Body).Decode(&orgName)
-	if err != nil {
-		return errors.Wrap(err, "Decode")
-	}
-	org, err := db.Orgs.GetByName(r.Context(), orgName)
-	if err != nil {
-		return errors.Wrap(err, "Orgs.GetByName")
-	}
-	if err := json.NewEncoder(w).Encode(org.ID); err != nil {
-		return errors.Wrap(err, "Encode")
-	}
-	return nil
 }
 
 func serveUsersGetByUsername(w http.ResponseWriter, r *http.Request) error {
@@ -391,7 +482,7 @@ func serveUsersGetByUsername(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return errors.Wrap(err, "Decode")
 	}
-	user, err := db.Users.GetByUsername(r.Context(), username)
+	user, err := database.GlobalUsers.GetByUsername(r.Context(), username)
 	if err != nil {
 		return errors.Wrap(err, "Users.GetByUsername")
 	}
@@ -407,7 +498,7 @@ func serveUserEmailsGetEmail(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return errors.Wrap(err, "Decode")
 	}
-	email, _, err := db.UserEmails.GetPrimaryEmail(r.Context(), userID)
+	email, _, err := database.GlobalUserEmails.GetPrimaryEmail(r.Context(), userID)
 	if err != nil {
 		return errors.Wrap(err, "UserEmails.GetEmail")
 	}
@@ -447,7 +538,7 @@ func serveGitResolveRevision(w http.ResponseWriter, r *http.Request) error {
 	spec := vars["Spec"]
 
 	// Do not to trigger a repo-updater lookup since this is a batch job.
-	commitID, err := git.ResolveRevision(r.Context(), gitserver.Repo{Name: name}, nil, spec, git.ResolveRevisionOptions{})
+	commitID, err := git.ResolveRevision(r.Context(), name, spec, git.ResolveRevisionOptions{})
 	if err != nil {
 		return err
 	}
@@ -460,12 +551,12 @@ func serveGitResolveRevision(w http.ResponseWriter, r *http.Request) error {
 func serveGitTar(w http.ResponseWriter, r *http.Request) error {
 	// used by zoekt-sourcegraph-mirror
 	vars := mux.Vars(r)
-	name := api.RepoName(vars["RepoName"])
+	name := vars["RepoName"]
 	spec := vars["Commit"]
 
 	// Ensure commit exists. Do not want to trigger a repo-updater lookup since this is a batch job.
-	repo := gitserver.Repo{Name: name}
-	commit, err := git.ResolveRevision(r.Context(), repo, nil, spec, git.ResolveRevisionOptions{})
+	repo := api.RepoName(name)
+	commit, err := git.ResolveRevision(r.Context(), repo, spec, git.ResolveRevisionOptions{})
 	if err != nil {
 		return err
 	}
@@ -475,7 +566,7 @@ func serveGitTar(w http.ResponseWriter, r *http.Request) error {
 		Format:  "tar",
 	}
 
-	location := gitserver.DefaultClient.ArchiveURL(r.Context(), repo, opts)
+	location := gitserver.DefaultClient.ArchiveURL(repo, opts)
 
 	w.Header().Set("Location", location.String())
 	w.WriteHeader(http.StatusFound)
@@ -497,7 +588,7 @@ func serveGitExec(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 
-	repo, err := db.Repos.Get(r.Context(), api.RepoID(repoID))
+	repo, err := database.GlobalRepos.Get(r.Context(), api.RepoID(repoID))
 	if err != nil {
 		return err
 	}
@@ -511,13 +602,13 @@ func serveGitExec(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	// Find the correct shard to query
-	addr := gitserver.DefaultClient.AddrForRepo(r.Context(), repo.Name)
+	addr := gitserver.DefaultClient.AddrForRepo(repo.Name)
 
 	director := func(req *http.Request) {
 		req.URL.Scheme = "http"
 		req.URL.Host = addr
 		req.URL.Path = "/exec"
-		req.Body = ioutil.NopCloser(bytes.NewReader(buf.Bytes()))
+		req.Body = io.NopCloser(bytes.NewReader(buf.Bytes()))
 		req.ContentLength = int64(buf.Len())
 	}
 
@@ -529,7 +620,7 @@ func serveGitExec(w http.ResponseWriter, r *http.Request) error {
 // gitserver for the repo.
 type gitServiceHandler struct {
 	Gitserver interface {
-		AddrForRepo(context.Context, api.RepoName) string
+		AddrForRepo(api.RepoName) string
 	}
 }
 
@@ -546,7 +637,7 @@ func (s *gitServiceHandler) redirectToGitServer(w http.ResponseWriter, r *http.R
 
 	u := &url.URL{
 		Scheme:   "http",
-		Host:     s.Gitserver.AddrForRepo(r.Context(), api.RepoName(repo)),
+		Host:     s.Gitserver.AddrForRepo(api.RepoName(repo)),
 		Path:     path.Join("/git", repo, gitPath),
 		RawQuery: r.URL.RawQuery,
 	}

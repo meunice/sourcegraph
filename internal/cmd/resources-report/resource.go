@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/cockroachdb/errors"
 )
 
 type Platform string
@@ -76,8 +78,12 @@ func generateReport(ctx context.Context, opts options, resources Resources) erro
 	var reportPage string
 	if *opts.sheetID != "" {
 		var err error
-		if reportPage, err = updateSheet(ctx, *opts.sheetID, filteredResources, highlighted); err != nil {
-			return fmt.Errorf("sheets: %w", err)
+		if reportPage, err = updateSheet(ctx, *opts.sheetID, filteredResources, updateSheetOptions{
+			HighlightedRows: highlighted,
+			PruneOlderThan:  *opts.sheetPruneOlderThan,
+			Verbose:         *opts.verbose,
+		}); err != nil {
+			return errors.Errorf("sheets: %w", err)
 		}
 	}
 
@@ -108,7 +114,7 @@ func generateReport(ctx context.Context, opts options, resources Resources) erro
 			},
 		}
 		if err := sendSlackBlocks(ctx, *opts.slackWebhook, blocks); err != nil {
-			return fmt.Errorf("slack: %w", err)
+			return errors.Errorf("slack: %w", err)
 		}
 	}
 

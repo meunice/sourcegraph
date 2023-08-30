@@ -1,8 +1,9 @@
 package reposource
 
 import (
-	"reflect"
 	"testing"
+
+	"github.com/cockroachdb/errors"
 
 	"github.com/sourcegraph/sourcegraph/schema"
 )
@@ -21,7 +22,7 @@ func TestOtherCloneURLToRepoName(t *testing.T) {
 			urls: []urlToRepoNameErr{
 				{"https://github.com/gorilla/mux", "github.com/gorilla/mux", nil},
 				{"https://github.com/gorilla/mux.git", "github.com/gorilla/mux", nil},
-				{"https://asdf.com/gorilla/mux.git", "", urlMismatchErr{"https://asdf.com/gorilla/mux.git", "https://github.com"}},
+				{"https://asdf.com/gorilla/mux.git", "", nil},
 			},
 		},
 		{
@@ -59,8 +60,8 @@ func TestOtherCloneURLToRepoName(t *testing.T) {
 			},
 			urls: []urlToRepoNameErr{
 				{"ssh://thaddeus@gerrit.com:12345/repos/repo1", "repo1", nil},
-				{"ssh://thaddeus@asdf.com/repos/repo1", "", urlMismatchErr{"ssh://thaddeus@asdf.com/repos/repo1", "ssh://thaddeus@gerrit.com:12345/repos"}},
-				{"ssh://thaddeus@gerrit.com:12345/asdf/repo1", "", urlMismatchErr{"ssh://thaddeus@gerrit.com:12345/asdf/repo1", "ssh://thaddeus@gerrit.com:12345/repos"}},
+				{"ssh://thaddeus@asdf.com/repos/repo1", "", nil},
+				{"ssh://thaddeus@gerrit.com:12345/asdf/repo1", "", nil},
 			},
 		},
 	}
@@ -69,7 +70,7 @@ func TestOtherCloneURLToRepoName(t *testing.T) {
 		for _, u := range test.urls {
 			repoName, err := Other{&test.conn}.CloneURLToRepoName(u.cloneURL)
 			if u.err != nil {
-				if !reflect.DeepEqual(u.err, err) {
+				if !errors.Is(err, u.err) {
 					t.Errorf("expected error [%v], but got [%v] for clone URL %q (connection: %+v)", u.err, err, u.cloneURL, test.conn)
 				}
 				continue

@@ -6,11 +6,36 @@ import (
 
 	"github.com/Masterminds/semver"
 	"github.com/google/go-cmp/cmp"
-	"github.com/sourcegraph/sourcegraph/internal/db/dbtesting"
+
+	"github.com/sourcegraph/sourcegraph/internal/database/dbtesting"
 )
 
 func init() {
 	dbtesting.DBNameSuffix = "backendtestdb"
+}
+
+func TestGetFirstServiceVersion(t *testing.T) {
+	dbtesting.SetupGlobalTestDB(t)
+
+	ctx := context.Background()
+
+	if err := UpdateServiceVersion(ctx, "service", "1.2.3"); err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+	if err := UpdateServiceVersion(ctx, "service", "1.2.4"); err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+	if err := UpdateServiceVersion(ctx, "service", "1.3.0"); err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+
+	firstVersion, err := GetFirstServiceVersion(ctx, "service")
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+	if firstVersion != "1.2.3" {
+		t.Errorf("unexpected first version. want=%s have=%s", "1.2.3", firstVersion)
+	}
 }
 
 func TestUpdateServiceVersion(t *testing.T) {
@@ -126,12 +151,6 @@ func TestIsValidUpgrade(t *testing.T) {
 		name:     "patch rollback",
 		previous: "v4.1.4",
 		latest:   "v4.1.3",
-		want:     true,
-	}, {
-		// https://github.com/sourcegraph/sourcegraph/issues/11666
-		name:     "issue 11666",
-		previous: "v0.0.0+dev",
-		latest:   "v3.17.1",
 		want:     true,
 	},
 	} {

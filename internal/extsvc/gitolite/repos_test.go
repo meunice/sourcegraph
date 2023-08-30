@@ -3,7 +3,10 @@ package gitolite
 import (
 	"testing"
 
+	"github.com/cockroachdb/errors"
 	"github.com/google/go-cmp/cmp"
+
+	"github.com/sourcegraph/sourcegraph/internal/errcode"
 )
 
 func TestDecodeRepos(t *testing.T) {
@@ -58,5 +61,17 @@ func TestDecodeRepos(t *testing.T) {
 				t.Error(diff)
 			}
 		})
+	}
+}
+
+func TestMaybeUnauthorized(t *testing.T) {
+	err := errors.New("random")
+	if errcode.IsUnauthorized(maybeUnauthorized(err)) {
+		t.Errorf("Should not be unauthorized")
+	}
+
+	err = errors.New("permission denied (public key)")
+	if !errcode.IsUnauthorized(maybeUnauthorized(err)) {
+		t.Errorf("Should be unauthorized")
 	}
 }

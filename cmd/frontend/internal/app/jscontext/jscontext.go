@@ -4,21 +4,24 @@ package jscontext
 
 import (
 	"bytes"
-	"io/ioutil"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/gorilla/csrf"
+
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/auth/providers"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/enterprise"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/envvar"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/globals"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/graphqlbackend"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/app/assetsutil"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/auth/userpasswd"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/pkg/siteid"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/siteid"
 	"github.com/sourcegraph/sourcegraph/internal/actor"
 	"github.com/sourcegraph/sourcegraph/internal/conf"
-	"github.com/sourcegraph/sourcegraph/internal/db/globalstatedb"
+	"github.com/sourcegraph/sourcegraph/internal/database/dbconn"
+	"github.com/sourcegraph/sourcegraph/internal/database/globalstatedb"
 	"github.com/sourcegraph/sourcegraph/internal/env"
 	"github.com/sourcegraph/sourcegraph/internal/lazyregexp"
 	"github.com/sourcegraph/sourcegraph/internal/version"
@@ -31,6 +34,7 @@ var BillingPublishableKey string
 type authProviderInfo struct {
 	IsBuiltin         bool   `json:"isBuiltin"`
 	DisplayName       string `json:"displayName"`
+	ServiceType       string `json:"serviceType"`
 	AuthenticationURL string `json:"authenticationURL"`
 }
 
@@ -75,9 +79,17 @@ type JSContext struct {
 
 	ResetPasswordEnabled bool `json:"resetPasswordEnabled"`
 
+	ExternalServicesUserMode string `json:"externalServicesUserMode"`
+
 	AuthProviders []authProviderInfo `json:"authProviders"`
 
 	Branding *schema.Branding `json:"branding"`
+
+	BatchChangesEnabled bool `json:"batchChangesEnabled"`
+
+	CodeIntelAutoIndexingEnabled bool `json:"codeIntelAutoIndexingEnabled"`
+
+	ProductResearchPageEnabled bool `json:"productResearchPageEnabled"`
 
 	ExperimentalFeatures schema.ExperimentalFeatures `json:"experimentalFeatures"`
 }
@@ -115,6 +127,7 @@ func NewJSContextFromRequest(req *http.Request) JSContext {
 			authProviders = append(authProviders, authProviderInfo{
 				IsBuiltin:         p.Config().Builtin != nil,
 				DisplayName:       info.DisplayName,
+				ServiceType:       p.ConfigID().Type,
 				AuthenticationURL: info.AuthenticationURL,
 			})
 		}
@@ -162,11 +175,19 @@ func NewJSContextFromRequest(req *http.Request) JSContext {
 
 		ResetPasswordEnabled: userpasswd.ResetPasswordEnabled(),
 
+		ExternalServicesUserMode: conf.ExternalServiceUserMode().String(),
+
 		AllowSignup: conf.AuthAllowSignup(),
 
 		AuthProviders: authProviders,
 
-		Branding: conf.Branding(),
+		Branding: globals.Branding(),
+
+		BatchChangesEnabled: enterprise.BatchChangesEnabledForUser(req.Context(), dbconn.Global) == nil,
+
+		CodeIntelAutoIndexingEnabled: conf.CodeIntelAutoIndexingEnabled(),
+
+		ProductResearchPageEnabled: conf.ProductResearchPageEnabled(),
 
 		ExperimentalFeatures: conf.ExperimentalFeatures(),
 	}
@@ -181,10 +202,10 @@ func publicSiteConfiguration() schema.SiteConfiguration {
 		updateChannel = "release"
 	}
 	return schema.SiteConfiguration{
-		AuthPublic:                 c.AuthPublic,
-		CampaignsReadAccessEnabled: c.CampaignsReadAccessEnabled,
-		PermissionsBackgroundSync:  c.PermissionsBackgroundSync,
-		UpdateChannel:              updateChannel,
+		AuthPublic:                  c.AuthPublic,
+		UpdateChannel:               updateChannel,
+		AuthzEnforceForSiteAdmins:   c.AuthzEnforceForSiteAdmins,
+		DisableNonCriticalTelemetry: c.DisableNonCriticalTelemetry,
 	}
 }
 
@@ -195,7 +216,7 @@ func isBot(userAgent string) bool {
 }
 
 func likelyDockerOnMac() bool {
-	data, err := ioutil.ReadFile("/proc/cmdline")
+	data, err := os.ReadFile("/proc/cmdline")
 	if err != nil {
 		return false // permission errors, or maybe not a Linux OS, etc. Assume we're not docker for mac.
 	}

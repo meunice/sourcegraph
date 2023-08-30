@@ -2,11 +2,12 @@ package server
 
 import (
 	"context"
-	"io/ioutil"
+	"io"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+
 	"github.com/sourcegraph/sourcegraph/internal/extsvc/gitolite"
 	"github.com/sourcegraph/sourcegraph/schema"
 )
@@ -49,7 +50,7 @@ func Test_Gitolite_listRepos(t *testing.T) {
 			w := httptest.NewRecorder()
 			g.listRepos(context.Background(), test.gitoliteHost, w)
 			resp := w.Result()
-			respBody, err := ioutil.ReadAll(resp.Body)
+			respBody, err := io.ReadAll(resp.Body)
 			if err != nil {
 				t.Fatal(err)
 			}

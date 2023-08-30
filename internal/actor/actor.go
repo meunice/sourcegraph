@@ -45,6 +45,7 @@ type key int
 
 const actorKey key = iota
 
+// FromContext returns a new Actor instance from a given context.
 func FromContext(ctx context.Context) *Actor {
 	a, ok := ctx.Value(actorKey).(*Actor)
 	if !ok || a == nil {
@@ -55,7 +56,11 @@ func FromContext(ctx context.Context) *Actor {
 
 func WithActor(ctx context.Context, a *Actor) context.Context {
 	if a != nil && a.UID != 0 {
-		trace.TraceUser(ctx, a.UID)
+		trace.User(ctx, a.UID)
 	}
 	return context.WithValue(ctx, actorKey, a)
+}
+
+func WithInternalActor(ctx context.Context) context.Context {
+	return context.WithValue(ctx, actorKey, &Actor{Internal: true})
 }

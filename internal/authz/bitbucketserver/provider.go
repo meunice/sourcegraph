@@ -4,19 +4,17 @@ package bitbucketserver
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"strconv"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	otlog "github.com/opentracing/opentracing-go/log"
-	"github.com/pkg/errors"
 
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/authz"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/types"
-	"github.com/sourcegraph/sourcegraph/internal/db/dbutil"
+	"github.com/sourcegraph/sourcegraph/internal/authz"
 	"github.com/sourcegraph/sourcegraph/internal/extsvc"
 	"github.com/sourcegraph/sourcegraph/internal/extsvc/bitbucketserver"
 	"github.com/sourcegraph/sourcegraph/internal/trace"
+	"github.com/sourcegraph/sourcegraph/internal/types"
 )
 
 // Provider is an implementation of AuthzProvider that provides repository permissions as
@@ -26,7 +24,6 @@ type Provider struct {
 	client   *bitbucketserver.Client
 	codeHost *extsvc.CodeHost
 	pageSize int // Page size to use in paginated requests.
-	store    *store
 
 	// pluginPerm enables fetching permissions from the alternative roaring
 	// bitmap endpoint provided by the Bitbucket Server Sourcegraph plugin:
@@ -36,19 +33,16 @@ type Provider struct {
 
 var _ authz.Provider = (*Provider)(nil)
 
-var clock = func() time.Time { return time.Now().UTC().Truncate(time.Microsecond) }
-
 // NewProvider returns a new Bitbucket Server authorization provider that uses
 // the given bitbucketserver.Client to talk to a Bitbucket Server API that is
 // the source of truth for permissions. It assumes usernames of Sourcegraph accounts
 // match 1-1 with usernames of Bitbucket Server API users.
-func NewProvider(cli *bitbucketserver.Client, db dbutil.DB, urn string, ttl, hardTTL time.Duration, pluginPerm bool) *Provider {
+func NewProvider(cli *bitbucketserver.Client, urn string, pluginPerm bool) *Provider {
 	return &Provider{
 		urn:        urn,
 		client:     cli,
 		codeHost:   extsvc.NewCodeHost(cli.URL, extsvc.TypeBitbucketServer),
 		pageSize:   1000,
-		store:      newStore(db, ttl, hardTTL, clock),
 		pluginPerm: pluginPerm,
 	}
 }
@@ -59,8 +53,12 @@ func (p *Provider) Validate() []string {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	_, err := p.client.UserPermissions(ctx, p.client.Username)
+	username, err := p.client.Username()
 	if err != nil {
+		return []string{err.Error()}
+	}
+
+	if _, err := p.client.UserPermissions(ctx, username); err != nil {
 		return []string{err.Error()}
 	}
 
@@ -78,85 +76,8 @@ func (p *Provider) ServiceID() string { return p.codeHost.ServiceID }
 // ServiceType returns the type of this Provider, namely, "bitbucketServer".
 func (p *Provider) ServiceType() string { return p.codeHost.ServiceType }
 
-// RepoPerms returns the permissions the given external account has in relation to the given set of repos.
-// It performs a single HTTP request against the Bitbucket Server API which returns all repositories
-// the authenticated user has permissions to read.
-func (p *Provider) RepoPerms(ctx context.Context, acct *extsvc.Account, repos []*types.Repo) (
-	perms []authz.RepoPerms,
-	err error,
-) {
-	var (
-		userName string
-		userID   int32
-	)
-
-	tr, ctx := trace.New(ctx, "bitbucket.authz.provider.RepoPerms", "")
-	defer func() {
-		tr.LogFields(
-			otlog.String("user.name", userName),
-			otlog.Int32("user.id", userID),
-			otlog.Int("repos.count", len(repos)),
-			otlog.Int("perms.count", len(perms)),
-		)
-
-		if err != nil {
-			tr.SetError(err)
-		}
-
-		tr.Finish()
-	}()
-
-	if acct != nil && acct.ServiceID == p.codeHost.ServiceID && acct.ServiceType == p.codeHost.ServiceType {
-		var user bitbucketserver.User
-		if err := json.Unmarshal(*acct.Data, &user); err != nil {
-			return nil, err
-		}
-
-		userID = acct.UserID
-		userName = user.Name
-	}
-
-	ps := &authz.UserPermissions{
-		UserID: userID,
-		Perm:   authz.Read,
-		Type:   authz.PermRepos,
-	}
-
-	err = p.store.LoadPermissions(ctx, ps, p.update(userName))
-	if err != nil {
-		return nil, err
-	}
-
-	return ps.AuthorizedRepos(repos), nil
-}
-
-// UpdatePermissions forces an update of the permissions of the given
-// user.
-func (p *Provider) UpdatePermissions(ctx context.Context, u *types.User) error {
-	ps := &authz.UserPermissions{
-		UserID: u.ID,
-		Perm:   authz.Read,
-		Type:   authz.PermRepos,
-	}
-
-	return p.store.UpdatePermissions(ctx, ps, p.update(u.Username))
-}
-
-// update returns a PermissionsUpdateFunc that fetches the IDs of
-// all the repos the user with the given userName is authorized to
-// see.
-func (p *Provider) update(userName string) PermissionsUpdateFunc {
-	return func(ctx context.Context) ([]uint32, *extsvc.CodeHost, error) {
-		visible, err := p.repoIDs(ctx, userName, true)
-		if err != nil && err != errNoResults {
-			return nil, p.codeHost, err
-		}
-		return visible, p.codeHost, nil
-	}
-}
-
 // FetchAccount satisfies the authz.Provider interface.
-func (p *Provider) FetchAccount(ctx context.Context, user *types.User, _ []*extsvc.Account) (acct *extsvc.Account, err error) {
+func (p *Provider) FetchAccount(ctx context.Context, user *types.User, _ []*extsvc.Account, _ []string) (acct *extsvc.Account, err error) {
 	if user == nil {
 		return nil, nil
 	}
@@ -206,14 +127,14 @@ func (p *Provider) FetchAccount(ctx context.Context, user *types.User, _ []*exts
 // callers to decide whether to discard.
 //
 // API docs: https://docs.atlassian.com/bitbucket-server/rest/5.16.0/bitbucket-rest.html#idm8296923984
-func (p *Provider) FetchUserPerms(ctx context.Context, account *extsvc.Account) ([]extsvc.RepoID, error) {
+func (p *Provider) FetchUserPerms(ctx context.Context, account *extsvc.Account) (*authz.ExternalUserPermissions, error) {
 	switch {
 	case account == nil:
 		return nil, errors.New("no account provided")
 	case account.Data == nil:
 		return nil, errors.New("no account data provided")
 	case !extsvc.IsHostOfAccount(p.codeHost, account):
-		return nil, fmt.Errorf("not a code host of the account: want %q but have %q",
+		return nil, errors.Errorf("not a code host of the account: want %q but have %q",
 			p.codeHost.ServiceID, account.AccountSpec.ServiceID)
 	}
 
@@ -229,7 +150,15 @@ func (p *Provider) FetchUserPerms(ctx context.Context, account *extsvc.Account) 
 		extIDs = append(extIDs, extsvc.RepoID(strconv.FormatUint(uint64(id), 10)))
 	}
 
-	return extIDs, err
+	return &authz.ExternalUserPermissions{
+		Exacts: extIDs,
+	}, err
+}
+
+// FetchUserPermsByToken is currently only required for syncing permissions for
+// GitHub and GitLab on sourcegraph.com
+func (p *Provider) FetchUserPermsByToken(ctx context.Context, token string) (*authz.ExternalUserPermissions, error) {
+	return nil, errors.New("not implemented")
 }
 
 // FetchRepoPerms returns a list of user IDs (on code host) who have read access to
@@ -246,7 +175,7 @@ func (p *Provider) FetchRepoPerms(ctx context.Context, repo *extsvc.Repository) 
 	case repo == nil:
 		return nil, errors.New("no repo provided")
 	case !extsvc.IsHostOfRepo(p.codeHost, &repo.ExternalRepoSpec):
-		return nil, fmt.Errorf("not a code host of the repo: want %q but have %q",
+		return nil, errors.Errorf("not a code host of the repo: want %q but have %q",
 			p.codeHost.ServiceID, repo.ServiceID)
 	}
 

@@ -2,10 +2,14 @@ package bitbucketserver
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"reflect"
@@ -16,6 +20,10 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/inconshreveable/log15"
 	"github.com/sergi/go-diff/diffmatchpatch"
+	"golang.org/x/time/rate"
+
+	"github.com/sourcegraph/sourcegraph/internal/extsvc/auth"
+	"github.com/sourcegraph/sourcegraph/schema"
 )
 
 var update = flag.Bool("update", false, "update testdata")
@@ -367,7 +375,7 @@ func TestClient_LoadPullRequest(t *testing.T) {
 				pr.ToRef.Repository.Project.Key = "SOUR"
 				return pr
 			},
-			err: "Bitbucket API HTTP error: code=404 url=\"${INSTANCEURL}/rest/api/1.0/projects/SOUR/repos/vegeta/pull-requests/9999\" body=\"{\\\"errors\\\":[{\\\"context\\\":null,\\\"message\\\":\\\"Pull request 9999 does not exist in SOUR/vegeta.\\\",\\\"exceptionName\\\":\\\"com.atlassian.bitbucket.pull.NoSuchPullRequestException\\\"}]}\"",
+			err: "pull request not found",
 		},
 		{
 			name: "non existing repo",
@@ -386,7 +394,7 @@ func TestClient_LoadPullRequest(t *testing.T) {
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			name := "PullRequests-" + strings.Replace(tc.name, " ", "-", -1)
+			name := "PullRequests-" + strings.ReplaceAll(tc.name, " ", "-")
 			cli, save := NewTestClient(t, name, *update)
 			defer save()
 
@@ -409,7 +417,7 @@ func TestClient_LoadPullRequest(t *testing.T) {
 				return
 			}
 
-			checkGolden(t, "LoadPullRequest-"+strings.Replace(tc.name, " ", "-", -1), pr)
+			checkGolden(t, "LoadPullRequest-"+strings.ReplaceAll(tc.name, " ", "-"), pr)
 		})
 	}
 }
@@ -426,9 +434,11 @@ func TestClient_CreatePullRequest(t *testing.T) {
 	pr := &PullRequest{}
 	pr.Title = "This is a test PR"
 	pr.Description = "This is a test PR. Feel free to ignore."
+	pr.ToRef.Repository.ID = 10070
 	pr.ToRef.Repository.Slug = "automation-testing"
 	pr.ToRef.Repository.Project.Key = "SOUR"
 	pr.ToRef.ID = "refs/heads/master"
+	pr.FromRef.Repository.ID = 10070
 	pr.FromRef.Repository.Slug = "automation-testing"
 	pr.FromRef.Repository.Project.Key = "SOUR"
 	pr.FromRef.ID = "refs/heads/test-pr-bbs-1"
@@ -528,7 +538,7 @@ func TestClient_CreatePullRequest(t *testing.T) {
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			name := "CreatePullRequest-" + strings.Replace(tc.name, " ", "-", -1)
+			name := "CreatePullRequest-" + strings.ReplaceAll(tc.name, " ", "-")
 
 			cli, save := NewTestClient(t, name, *update)
 			defer save()
@@ -553,6 +563,151 @@ func TestClient_CreatePullRequest(t *testing.T) {
 			}
 
 			checkGolden(t, name, pr)
+		})
+	}
+}
+
+func TestClient_FetchDefaultReviewers(t *testing.T) {
+	instanceURL := os.Getenv("BITBUCKET_SERVER_URL")
+	if instanceURL == "" {
+		instanceURL = "https://bitbucket.sgdev.org"
+	}
+
+	timeout, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	pr := &PullRequest{}
+	pr.Title = "This is a test PR"
+	pr.Description = "This is a test PR. Feel free to ignore."
+	pr.ToRef.Repository.ID = 10070
+	pr.ToRef.Repository.Slug = "automation-testing"
+	pr.ToRef.Repository.Project.Key = "SOUR"
+	pr.ToRef.ID = "refs/heads/master"
+	pr.FromRef.Repository.ID = 10070
+	pr.FromRef.Repository.Slug = "automation-testing"
+	pr.FromRef.Repository.Project.Key = "SOUR"
+	pr.FromRef.ID = "refs/heads/test-pr-bbs-1"
+
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+		pr   func() *PullRequest
+		err  string
+	}{
+		{
+			name: "timeout",
+			pr:   func() *PullRequest { return pr },
+			ctx:  timeout,
+			err:  "context deadline exceeded",
+		},
+		{
+			name: "ToRef repo id not set",
+			pr: func() *PullRequest {
+				pr := *pr
+				pr.ToRef.Repository.ID = 0
+				return &pr
+			},
+			err: "ToRef repository id empty",
+		},
+		{
+			name: "ToRef repo slug not set",
+			pr: func() *PullRequest {
+				pr := *pr
+				pr.ToRef.Repository.Slug = ""
+				return &pr
+			},
+			err: "ToRef repository slug empty",
+		},
+		{
+			name: "ToRef project not set",
+			pr: func() *PullRequest {
+				pr := *pr
+				pr.ToRef.Repository.Project.Key = ""
+				return &pr
+			},
+			err: "ToRef project key empty",
+		},
+		{
+			name: "ToRef ID not set",
+			pr: func() *PullRequest {
+				pr := *pr
+				pr.ToRef.ID = ""
+				return &pr
+			},
+			err: "ToRef id empty",
+		},
+		{
+			name: "FromRef repo id not set",
+			pr: func() *PullRequest {
+				pr := *pr
+				pr.FromRef.Repository.ID = 0
+				return &pr
+			},
+			err: "FromRef repository id empty",
+		},
+		{
+			name: "FromRef repo slug not set",
+			pr: func() *PullRequest {
+				pr := *pr
+				pr.FromRef.Repository.Slug = ""
+				return &pr
+			},
+			err: "FromRef repository slug empty",
+		},
+		{
+			name: "FromRef project not set",
+			pr: func() *PullRequest {
+				pr := *pr
+				pr.FromRef.Repository.Project.Key = ""
+				return &pr
+			},
+			err: "FromRef project key empty",
+		},
+		{
+			name: "FromRef ID not set",
+			pr: func() *PullRequest {
+				pr := *pr
+				pr.FromRef.ID = ""
+				return &pr
+			},
+			err: "FromRef id empty",
+		},
+		{
+			name: "success",
+			pr: func() *PullRequest {
+				pr := *pr
+				pr.FromRef.ID = "refs/heads/test-pr-bbs-3"
+				return &pr
+			},
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			name := "FetchDefaultReviewers-" + strings.ReplaceAll(tc.name, " ", "-")
+
+			cli, save := NewTestClient(t, name, *update)
+			defer save()
+
+			if tc.ctx == nil {
+				tc.ctx = context.Background()
+			}
+
+			if tc.err == "" {
+				tc.err = "<nil>"
+			}
+			tc.err = strings.ReplaceAll(tc.err, "${INSTANCEURL}", instanceURL)
+
+			pr := tc.pr()
+			reviewers, err := cli.FetchDefaultReviewers(tc.ctx, pr)
+			if have, want := fmt.Sprint(err), tc.err; have != want {
+				t.Fatalf("error:\nhave: %q\nwant: %q", have, want)
+			}
+
+			if err != nil || tc.err != "<nil>" {
+				return
+			}
+
+			checkGolden(t, name, reviewers)
 		})
 	}
 }
@@ -612,7 +767,7 @@ func TestClient_DeclinePullRequest(t *testing.T) {
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			name := "DeclinePullRequest-" + strings.Replace(tc.name, " ", "-", -1)
+			name := "DeclinePullRequest-" + strings.ReplaceAll(tc.name, " ", "-")
 
 			cli, save := NewTestClient(t, name, *update)
 			defer save()
@@ -709,7 +864,179 @@ func TestClient_LoadPullRequestActivities(t *testing.T) {
 				return
 			}
 
-			checkGolden(t, "LoadPullRequestActivities-"+strings.Replace(tc.name, " ", "-", -1), pr)
+			checkGolden(t, "LoadPullRequestActivities-"+strings.ReplaceAll(tc.name, " ", "-"), pr)
+		})
+	}
+}
+
+func TestClient_CreatePullRequestComment(t *testing.T) {
+	instanceURL := os.Getenv("BITBUCKET_SERVER_URL")
+	if instanceURL == "" {
+		instanceURL = "https://bitbucket.sgdev.org"
+	}
+
+	timeout, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	pr := &PullRequest{}
+	pr.ToRef.Repository.Slug = "automation-testing"
+	pr.ToRef.Repository.Project.Key = "SOUR"
+
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+		pr   func() *PullRequest
+		err  string
+	}{
+		{
+			name: "timeout",
+			pr:   func() *PullRequest { return pr },
+			ctx:  timeout,
+			err:  "context deadline exceeded",
+		},
+		{
+			name: "ToRef repo not set",
+			pr: func() *PullRequest {
+				pr := *pr
+				pr.ToRef.Repository.Slug = ""
+				return &pr
+			},
+			err: "repository slug empty",
+		},
+		{
+			name: "ToRef project not set",
+			pr: func() *PullRequest {
+				pr := *pr
+				pr.ToRef.Repository.Project.Key = ""
+				return &pr
+			},
+			err: "project key empty",
+		},
+		{
+			name: "success",
+			pr: func() *PullRequest {
+				pr := *pr
+				pr.ID = 63
+				pr.Version = 2
+				return &pr
+			},
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			name := "CreatePullRequestComment-" + strings.ReplaceAll(tc.name, " ", "-")
+
+			cli, save := NewTestClient(t, name, *update)
+			defer save()
+
+			if tc.ctx == nil {
+				tc.ctx = context.Background()
+			}
+
+			if tc.err == "" {
+				tc.err = "<nil>"
+			}
+			tc.err = strings.ReplaceAll(tc.err, "${INSTANCEURL}", instanceURL)
+
+			pr := tc.pr()
+			err := cli.CreatePullRequestComment(tc.ctx, pr, "test_comment")
+			if have, want := fmt.Sprint(err), tc.err; have != want {
+				t.Fatalf("error:\nhave: %q\nwant: %q", have, want)
+			}
+		})
+	}
+}
+
+func TestClient_MergePullRequest(t *testing.T) {
+	instanceURL := os.Getenv("BITBUCKET_SERVER_URL")
+	if instanceURL == "" {
+		instanceURL = "https://bitbucket.sgdev.org"
+	}
+
+	timeout, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	pr := &PullRequest{}
+	pr.ToRef.Repository.Slug = "automation-testing"
+	pr.ToRef.Repository.Project.Key = "SOUR"
+
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+		pr   func() *PullRequest
+		err  string
+	}{
+		{
+			name: "timeout",
+			pr:   func() *PullRequest { return pr },
+			ctx:  timeout,
+			err:  "context deadline exceeded",
+		},
+		{
+			name: "ToRef repo not set",
+			pr: func() *PullRequest {
+				pr := *pr
+				pr.ToRef.Repository.Slug = ""
+				return &pr
+			},
+			err: "repository slug empty",
+		},
+		{
+			name: "ToRef project not set",
+			pr: func() *PullRequest {
+				pr := *pr
+				pr.ToRef.Repository.Project.Key = ""
+				return &pr
+			},
+			err: "project key empty",
+		},
+		{
+			name: "success",
+			pr: func() *PullRequest {
+				pr := *pr
+				pr.ID = 146
+				pr.Version = 0
+				return &pr
+			},
+		},
+		{
+			name: "not mergeable",
+			pr: func() *PullRequest {
+				pr := *pr
+				pr.ID = 146
+				pr.Version = 1
+				return &pr
+			},
+			err: "pull request cannot be merged",
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			name := "MergePullRequest-" + strings.ReplaceAll(tc.name, " ", "-")
+
+			cli, save := NewTestClient(t, name, *update)
+			defer save()
+
+			if tc.ctx == nil {
+				tc.ctx = context.Background()
+			}
+
+			if tc.err == "" {
+				tc.err = "<nil>"
+			}
+			tc.err = strings.ReplaceAll(tc.err, "${INSTANCEURL}", instanceURL)
+
+			pr := tc.pr()
+			err := cli.MergePullRequest(tc.ctx, pr)
+			if have, want := fmt.Sprint(err), tc.err; !strings.Contains(have, want) {
+				t.Fatalf("error:\nhave: %q\nwant: %q", have, want)
+			}
+
+			if err != nil || tc.err != "<nil>" {
+				return
+			}
+
+			checkGolden(t, name, pr)
 		})
 	}
 }
@@ -740,12 +1067,12 @@ func checkGolden(t *testing.T, name string, got interface{}) {
 
 	path := "testdata/golden/" + name
 	if *update {
-		if err = ioutil.WriteFile(path, data, 0640); err != nil {
+		if err = os.WriteFile(path, data, 0640); err != nil {
 			t.Fatalf("failed to update golden file %q: %s", path, err)
 		}
 	}
 
-	golden, err := ioutil.ReadFile(path)
+	golden, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("failed to read golden file %q: %s", path, err)
 	}
@@ -754,6 +1081,211 @@ func checkGolden(t *testing.T, name string, got interface{}) {
 		dmp := diffmatchpatch.New()
 		diffs := dmp.DiffMain(have, want, false)
 		t.Error(dmp.DiffPrettyText(diffs))
+	}
+}
+
+func TestAuth(t *testing.T) {
+	t.Run("auth from config", func(t *testing.T) {
+		// Ensure that the different configuration types create the right
+		// implicit Authenticator.
+		t.Run("bearer token", func(t *testing.T) {
+			client, err := NewClient(&schema.BitbucketServerConnection{
+				Url:   "http://example.com/",
+				Token: "foo",
+			}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			want := &auth.OAuthBearerToken{Token: "foo"}
+			if have, ok := client.Auth.(*auth.OAuthBearerToken); !ok {
+				t.Errorf("unexpected Authenticator: have=%T want=%T", client.Auth, want)
+			} else if diff := cmp.Diff(have, want); diff != "" {
+				t.Errorf("unexpected token:\n%s", diff)
+			}
+		})
+
+		t.Run("basic auth", func(t *testing.T) {
+			client, err := NewClient(&schema.BitbucketServerConnection{
+				Url:      "http://example.com/",
+				Username: "foo",
+				Password: "bar",
+			}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			want := &auth.BasicAuth{Username: "foo", Password: "bar"}
+			if have, ok := client.Auth.(*auth.BasicAuth); !ok {
+				t.Errorf("unexpected Authenticator: have=%T want=%T", client.Auth, want)
+			} else if diff := cmp.Diff(have, want); diff != "" {
+				t.Errorf("unexpected token:\n%s", diff)
+			}
+		})
+
+		t.Run("OAuth 1 error", func(t *testing.T) {
+			if _, err := NewClient(&schema.BitbucketServerConnection{
+				Url: "http://example.com/",
+				Authorization: &schema.BitbucketServerAuthorization{
+					Oauth: schema.BitbucketServerOAuth{
+						ConsumerKey: "foo",
+						SigningKey:  "this is an invalid key",
+					},
+				},
+			}, nil); err == nil {
+				t.Error("unexpected nil error")
+			}
+
+		})
+
+		t.Run("OAuth 1", func(t *testing.T) {
+			// Generate a plausible enough key with as little entropy as
+			// possible just to get through the SetOAuth validation.
+			key, err := rsa.GenerateKey(rand.Reader, 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			block := x509.MarshalPKCS1PrivateKey(key)
+			pemKey := pem.EncodeToMemory(&pem.Block{Bytes: block})
+			signingKey := base64.StdEncoding.EncodeToString(pemKey)
+
+			client, err := NewClient(&schema.BitbucketServerConnection{
+				Url: "http://example.com/",
+				Authorization: &schema.BitbucketServerAuthorization{
+					Oauth: schema.BitbucketServerOAuth{
+						ConsumerKey: "foo",
+						SigningKey:  signingKey,
+					},
+				},
+			}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if have, ok := client.Auth.(*SudoableOAuthClient); !ok {
+				t.Errorf("unexpected Authenticator: have=%T want=%T", client.Auth, &SudoableOAuthClient{})
+			} else if have.Client.Client.Credentials.Token != "foo" {
+				t.Errorf("unexpected token: have=%q want=%q", have.Client.Client.Credentials.Token, "foo")
+			} else if diff := cmp.Diff(have.Client.Client.PrivateKey, key, cmp.Comparer(func(a, b *rsa.PrivateKey) bool {
+				// This is adapted from the useful PrivateKey.Equal() function
+				// in Go 1.15, which we can't rely on at present due to being
+				// much too new.
+				if a.PublicKey.E != b.PublicKey.E {
+					return false
+				}
+				if a.PublicKey.N.Cmp(b.PublicKey.N) != 0 {
+					return false
+				}
+				if a.D.Cmp(b.D) != 0 {
+					return false
+				}
+				if len(a.Primes) != len(b.Primes) {
+					return false
+				}
+				for i := range a.Primes {
+					if a.Primes[i].Cmp(b.Primes[i]) != 0 {
+						return false
+					}
+				}
+
+				return true
+			})); diff != "" {
+				t.Errorf("unexpected key:\n%s", diff)
+			}
+		})
+	})
+
+	t.Run("Username", func(t *testing.T) {
+		t.Run("success", func(t *testing.T) {
+			for name, tc := range map[string]struct {
+				a    auth.Authenticator
+				want string
+			}{
+				"OAuth 1 without Sudo": {
+					a:    &SudoableOAuthClient{},
+					want: "",
+				},
+				"OAuth 1 with Sudo": {
+					a:    &SudoableOAuthClient{Username: "foo"},
+					want: "foo",
+				},
+				"BasicAuth": {
+					a:    &auth.BasicAuth{Username: "foo"},
+					want: "foo",
+				},
+			} {
+				t.Run(name, func(t *testing.T) {
+					client := &Client{Auth: tc.a}
+					have, err := client.Username()
+					if err != nil {
+						t.Errorf("unexpected non-nil error: %v", err)
+					}
+					if have != tc.want {
+						t.Errorf("unexpected username: have=%q want=%q", have, tc.want)
+					}
+				})
+			}
+		})
+
+		t.Run("errors", func(t *testing.T) {
+			for name, a := range map[string]auth.Authenticator{
+				"OAuth 2 token": &auth.OAuthBearerToken{Token: "abcdef"},
+				"nil":           nil,
+			} {
+				t.Run(name, func(t *testing.T) {
+					client := &Client{Auth: a}
+					if _, err := client.Username(); err == nil {
+						t.Errorf("unexpected nil error: %v", err)
+					}
+				})
+			}
+		})
+	})
+}
+
+func TestClient_WithAuthenticator(t *testing.T) {
+	uri, err := url.Parse("https://bbs.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	old := &Client{
+		URL:       uri,
+		RateLimit: rate.NewLimiter(defaultRateLimit, defaultRateLimitBurst),
+		Auth:      &auth.BasicAuth{Username: "johnsson", Password: "mothersmaidenname"},
+	}
+
+	newToken := &auth.OAuthBearerToken{Token: "new_token"}
+	newClient := old.WithAuthenticator(newToken)
+	if old == newClient {
+		t.Fatal("both clients have the same address")
+	}
+
+	if newClient.Auth != newToken {
+		t.Fatalf("auth: want %q but got %q", newToken, newClient.Auth)
+	}
+
+	if newClient.URL != old.URL {
+		t.Fatalf("url: want %q but got %q", old.URL, newClient.URL)
+	}
+
+	if newClient.RateLimit != old.RateLimit {
+		t.Fatalf("RateLimit: want %#v but got %#v", old.RateLimit, newClient.RateLimit)
+	}
+}
+
+func TestClient_GetVersion(t *testing.T) {
+	fixture := "GetVersion"
+	cli, save := NewTestClient(t, fixture, *update)
+	defer save()
+
+	have, err := cli.GetVersion(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if want := "7.11.2"; have != want {
+		t.Fatalf("wrong version. want=%s, have=%s", want, have)
 	}
 }
 

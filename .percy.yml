@@ -1,0 +1,9 @@
+version: 1
+snapshot:
+  widths:
+    - 1920 # Full-width browser window
+  percy-css: |
+    .percy-hide,
+    .monaco-editor .cursor {
+      visibility: hidden !important;
+    }

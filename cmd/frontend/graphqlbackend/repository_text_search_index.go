@@ -2,12 +2,14 @@ package graphqlbackend
 
 import (
 	"context"
-	"fmt"
 	"sync"
 
+	"github.com/cockroachdb/errors"
 	"github.com/google/zoekt"
 	zoektquery "github.com/google/zoekt/query"
+
 	"github.com/sourcegraph/sourcegraph/internal/search"
+	"github.com/sourcegraph/sourcegraph/internal/vcs/git"
 )
 
 func (r *RepositoryResolver) TextSearchIndex() *repositoryTextSearchIndexResolver {
@@ -30,18 +32,19 @@ type repositoryTextSearchIndexResolver struct {
 }
 
 type repoLister interface {
-	List(ctx context.Context, q zoektquery.Q) (*zoekt.RepoList, error)
+	List(ctx context.Context, q zoektquery.Q, opts *zoekt.ListOptions) (*zoekt.RepoList, error)
 }
 
 func (r *repositoryTextSearchIndexResolver) resolve(ctx context.Context) (*zoekt.RepoListEntry, error) {
 	r.once.Do(func() {
-		repoList, err := r.client.List(ctx, zoektquery.NewRepoSet(string(r.repo.repo.Name)))
+		q := &zoektquery.RepoBranches{Set: map[string][]string{r.repo.Name(): {"HEAD"}}}
+		repoList, err := r.client.List(ctx, q, nil)
 		if err != nil {
 			r.err = err
 			return
 		}
 		if len(repoList.Repos) > 1 {
-			r.err = fmt.Errorf("more than 1 indexed repo found for %q", r.repo.repo.Name)
+			r.err = errors.Errorf("more than 1 indexed repo found for %q", r.repo.Name())
 			return
 		}
 		if len(repoList.Repos) == 1 {
@@ -85,7 +88,19 @@ func (r *repositoryTextSearchIndexStatus) IndexByteSize() int32 {
 }
 
 func (r *repositoryTextSearchIndexStatus) IndexShardsCount() int32 {
-	return int32(r.entry.Stats.Shards + 1)
+	return int32(r.entry.Stats.Shards)
+}
+
+func (r *repositoryTextSearchIndexStatus) NewLinesCount() int32 {
+	return int32(r.entry.Stats.NewLinesCount)
+}
+
+func (r *repositoryTextSearchIndexStatus) DefaultBranchNewLinesCount() int32 {
+	return int32(r.entry.Stats.DefaultBranchNewLinesCount)
+}
+
+func (r *repositoryTextSearchIndexStatus) OtherBranchesNewLinesCount() int32 {
+	return int32(r.entry.Stats.OtherBranchesNewLinesCount)
 }
 
 func (r *repositoryTextSearchIndexResolver) Refs(ctx context.Context) ([]*repositoryTextSearchIndexedRef, error) {
@@ -105,15 +120,22 @@ func (r *repositoryTextSearchIndexResolver) Refs(ctx context.Context) ([]*reposi
 	for i, refName := range refNames {
 		refs[i] = &repositoryTextSearchIndexedRef{ref: &GitRefResolver{name: refName, repo: r.repo}}
 	}
-	refByName := func(refName string) *repositoryTextSearchIndexedRef {
+	refByName := func(name string) *repositoryTextSearchIndexedRef {
+		possibleRefNames := []string{"refs/heads/" + name, "refs/tags/" + name}
+		for _, ref := range possibleRefNames {
+			if _, err := git.ResolveRevision(ctx, r.repo.RepoName(), ref, git.ResolveRevisionOptions{NoEnsureRevision: true}); err == nil {
+				name = ref
+				break
+			}
+		}
 		for _, ref := range refs {
-			if ref.ref.name == refName {
+			if ref.ref.name == name {
 				return ref
 			}
 		}
 
 		// If Zoekt reports it has another indexed branch, include that.
-		newRef := &repositoryTextSearchIndexedRef{ref: &GitRefResolver{name: refName, repo: r.repo}}
+		newRef := &repositoryTextSearchIndexedRef{ref: &GitRefResolver{name: name, repo: r.repo}}
 		refs = append(refs, newRef)
 		return newRef
 	}
@@ -148,11 +170,11 @@ func (r *repositoryTextSearchIndexedRef) Current(ctx context.Context) (bool, err
 		return false, nil
 	}
 
-	target, err := r.ref.Target().OID(ctx)
+	commit, err := r.ref.Target().Commit(ctx)
 	if err != nil {
 		return false, err
 	}
-	return target == r.indexedCommit, nil
+	return commit.oid == r.indexedCommit, nil
 }
 
 func (r *repositoryTextSearchIndexedRef) IndexedCommit() *gitObject {

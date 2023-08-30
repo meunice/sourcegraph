@@ -5,12 +5,12 @@ import (
 	"time"
 
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/backend"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/app/pkg/updatecheck"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/app/updatecheck"
 )
 
 func (r *siteResolver) UpdateCheck(ctx context.Context) (*updateCheckResolver, error) {
 	// 🚨 SECURITY: Only site admins can check for updates.
-	if err := backend.CheckCurrentUserIsSiteAdmin(ctx); err != nil {
+	if err := backend.CheckCurrentUserIsSiteAdmin(ctx, r.db); err != nil {
 		// TODO(dax): This should return err once the site flags query is fixed for users
 		return &updateCheckResolver{
 			last: &updatecheck.Status{

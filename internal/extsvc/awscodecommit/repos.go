@@ -7,7 +7,9 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/codecommit"
+	codecommittypes "github.com/aws/aws-sdk-go-v2/service/codecommit/types"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
 // Repository is an AWS CodeCommit repository.
@@ -44,7 +46,11 @@ func (c *Client) GetRepository(ctx context.Context, arn string) (*Repository, er
 	if GetRepositoryMock != nil {
 		return GetRepositoryMock(ctx, arn)
 	}
-	return c.cachedGetRepository(ctx, arn)
+	r, err := c.cachedGetRepository(ctx, arn)
+	if err != nil {
+		return r, &wrappedError{err: err}
+	}
+	return r, nil
 }
 
 // cachedGetRepository caches the getRepositoryFromAPI call.
@@ -79,14 +85,10 @@ func (c *Client) cachedGetRepository(ctx context.Context, arn string) (*Reposito
 	return repo, nil
 }
 
-var reposCacheCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
+var reposCacheCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "src_repos_awscodecommit_cache_hit",
 	Help: "Counts cache hits and misses for AWS CodeCommit repo metadata.",
 }, []string{"type"})
-
-func init() {
-	prometheus.MustRegister(reposCacheCounter)
-}
 
 type cachedRepo struct {
 	Repository
@@ -131,10 +133,8 @@ func (c *Client) getRepositoryFromAPI(ctx context.Context, arn string) (*Reposit
 		repoName = arn[i+1:]
 	}
 
-	svc := codecommit.New(c.aws)
-	req := svc.GetRepositoryRequest(&codecommit.GetRepositoryInput{RepositoryName: &repoName})
-	req.SetContext(ctx)
-	result, err := req.Send(ctx)
+	svc := codecommit.NewFromConfig(c.aws)
+	result, err := svc.GetRepository(ctx, &codecommit.GetRepositoryInput{RepositoryName: &repoName})
 	if err != nil {
 		return nil, err
 	}
@@ -147,19 +147,23 @@ const MaxMetadataBatch = 25
 
 // ListRepositories calls the ListRepositories API method of AWS CodeCommit.
 func (c *Client) ListRepositories(ctx context.Context, nextToken string) (repos []*Repository, nextNextToken string, err error) {
-	svc := codecommit.New(c.aws)
+	defer func() {
+		if err != nil {
+			err = &wrappedError{err}
+		}
+	}()
+
+	svc := codecommit.NewFromConfig(c.aws)
 
 	// List repositories.
 	listInput := codecommit.ListRepositoriesInput{
-		Order:  codecommit.OrderEnumDescending,
-		SortBy: codecommit.SortByEnumLastModifiedDate,
+		Order:  codecommittypes.OrderEnumDescending,
+		SortBy: codecommittypes.SortByEnumModifiedDate,
 	}
 	if nextToken != "" {
 		listInput.NextToken = &nextToken
 	}
-	listReq := svc.ListRepositoriesRequest(&listInput)
-	listReq.SetContext(ctx)
-	listResult, err := listReq.Send(ctx)
+	listResult, err := svc.ListRepositories(ctx, &listInput)
 	if err != nil {
 		return nil, "", err
 	}
@@ -194,9 +198,7 @@ func (c *Client) ListRepositories(ctx context.Context, nextToken string) (repos 
 
 func (c *Client) getRepositories(ctx context.Context, svc *codecommit.Client, repositoryNames []string) ([]*Repository, error) {
 	getInput := codecommit.BatchGetRepositoriesInput{RepositoryNames: repositoryNames}
-	getReq := svc.BatchGetRepositoriesRequest(&getInput)
-	getReq.SetContext(ctx)
-	getResult, err := getReq.Send(ctx)
+	getResult, err := svc.BatchGetRepositories(ctx, &getInput)
 	if err != nil {
 		return nil, err
 	}
@@ -217,7 +219,26 @@ func (c *Client) getRepositories(ctx context.Context, svc *codecommit.Client, re
 	return repos, nil
 }
 
-func fromRepoMetadata(m *codecommit.RepositoryMetadata) *Repository {
+type wrappedError struct {
+	err error
+}
+
+func (w *wrappedError) Error() string {
+	if w.err != nil {
+		return w.err.Error()
+	}
+	return ""
+}
+
+func (w *wrappedError) NotFound() bool {
+	return IsNotFound(w.err)
+}
+
+func (w *wrappedError) Unauthorized() bool {
+	return IsUnauthorized(w.err)
+}
+
+func fromRepoMetadata(m *codecommittypes.RepositoryMetadata) *Repository {
 	repo := Repository{
 		ARN:          *m.Arn,
 		AccountID:    *m.AccountId,

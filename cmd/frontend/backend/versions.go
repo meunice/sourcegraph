@@ -8,8 +8,9 @@ import (
 
 	"github.com/Masterminds/semver"
 	"github.com/keegancsmith/sqlf"
-	"github.com/sourcegraph/sourcegraph/internal/db/dbconn"
-	"github.com/sourcegraph/sourcegraph/internal/db/dbutil"
+
+	"github.com/sourcegraph/sourcegraph/internal/database/dbconn"
+	"github.com/sourcegraph/sourcegraph/internal/database/dbutil"
 )
 
 // UpgradeError is returned by UpdateServiceVersion when it faces an
@@ -29,8 +30,22 @@ func (e UpgradeError) Error() string {
 		e.Latest,
 		"https://docs.sourcegraph.com/#upgrading-sourcegraph",
 	)
-
 }
+
+// GetFirstServiceVersion returns the first version registered for the given Sourcegraph service.
+// This method will return an error if UpdateServiceVersion has never been called for the given
+// service.
+func GetFirstServiceVersion(ctx context.Context, service string) (version string, err error) {
+	q := sqlf.Sprintf(getFirstVersionQuery, service)
+	row := dbconn.Global.QueryRowContext(ctx, q.Query(sqlf.PostgresBindVar), q.Args()...)
+	if err = row.Scan(&version); err != nil {
+		return "", err
+	}
+
+	return version, nil
+}
+
+const getFirstVersionQuery = `SELECT first_version FROM versions WHERE service = %s`
 
 // UpdateServiceVersion updates the latest version for the given Sourcegraph
 // service. It enforces our documented upgrade policy.
@@ -82,11 +97,6 @@ WHERE versions.version = %s`
 func IsValidUpgrade(previous, latest *semver.Version) bool {
 	switch {
 	case previous == nil || latest == nil:
-		return true
-	case previous.Major() == 0 && previous.Minor() == 0 && previous.Patch() == 0:
-		// https://github.com/sourcegraph/sourcegraph/issues/11666
-		//
-		// TODO(slimsag): Remove this switch case Oct, 1st 2020
 		return true
 	case previous.Major() > latest.Major():
 		return true

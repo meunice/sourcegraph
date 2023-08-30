@@ -4,11 +4,9 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
-	"io/ioutil"
 	"os"
 
 	"github.com/sourcegraph/sourcegraph/internal/api"
-	"github.com/sourcegraph/sourcegraph/internal/gitserver"
 	"github.com/sourcegraph/sourcegraph/internal/store"
 )
 
@@ -58,7 +56,7 @@ func TempZipFromFiles(files map[string]string) (path string, cleanup func(), err
 	}
 
 	ctx := context.Background()
-	repo := gitserver.Repo{Name: "foo", URL: "u"}
+	repo := api.RepoName("foo")
 	var commit api.CommitID = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 	path, err = s.PrepareZip(ctx, repo, commit)
 	if err != nil {
@@ -72,11 +70,11 @@ func TempZipFileOnDisk(data []byte) (string, func(), error) {
 	if err != nil {
 		return "", nil, err
 	}
-	d, err := ioutil.TempDir("", "temp_zip_dir")
+	d, err := os.MkdirTemp("", "temp_zip_dir")
 	if err != nil {
 		return "", nil, err
 	}
-	f, err := ioutil.TempFile(d, "temp_zip")
+	f, err := os.CreateTemp(d, "temp_zip")
 	if err != nil {
 		return "", nil, err
 	}

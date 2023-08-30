@@ -5,17 +5,22 @@ import (
 	"sync"
 	"time"
 
-	"github.com/efritz/glock"
+	"github.com/cockroachdb/errors"
+	"github.com/derision-test/glock"
 	"github.com/inconshreveable/log15"
-	"github.com/keegancsmith/sqlf"
-	"github.com/pkg/errors"
+
+	"github.com/sourcegraph/sourcegraph/internal/errcode"
+	"github.com/sourcegraph/sourcegraph/internal/hostname"
 	"github.com/sourcegraph/sourcegraph/internal/observation"
-	"github.com/sourcegraph/sourcegraph/internal/trace/ot"
 )
+
+// ErrJobAlreadyExists occurs when a duplicate job identifier is dequeued.
+var ErrJobAlreadyExists = errors.New("job already exists")
 
 // Worker is a generic consumer of records from the workerutil store.
 type Worker struct {
 	store            Store
+	handler          Handler
 	options          WorkerOptions
 	clock            glock.Clock
 	handlerSemaphore chan struct{}   // tracks available handler slots
@@ -23,82 +28,50 @@ type Worker struct {
 	cancel           func()          // cancels the root context
 	wg               sync.WaitGroup  // tracks active handler routines
 	finished         chan struct{}   // signals that Start has finished
+	runningIDSet     *IDSet          // tracks the running job IDs to heartbeat
 }
 
 type WorkerOptions struct {
-	Name        string
-	Handler     Handler
+	// Name denotes the name of the worker used to distinguish log messages and
+	// emitted metrics. The worker constructor will fail if this field is not
+	// supplied.
+	Name string
+
+	// WorkerHostname denotes the hostname of the instance/container the worker
+	// is running on. If not supplied, it will be derived from either the `HOSTNAME`
+	// env var, or else from os.Hostname()
+	WorkerHostname string
+
+	// NumHandlers is the maximum number of handlers that can be invoked
+	// concurrently. The underlying store will not be queried while the current
+	// number of handlers exceeds this value.
 	NumHandlers int
-	Interval    time.Duration
-	Metrics     WorkerMetrics
+
+	// Interval is the frequency to poll the underlying store for new work.
+	Interval time.Duration
+
+	// HeartbeatInterval is the interval between heartbeat updates to a job's last_heartbeat_at field. This
+	// field is periodically updated while being actively processed to signal to other workers that the
+	// record is neither pending nor abandoned.
+	HeartbeatInterval time.Duration
+
+	// Metrics configures logging, tracing, and metrics for the work loop.
+	Metrics WorkerMetrics
 }
 
-// Handler is the configurable consumer within a worker. Types that conform to this
-// interface may also optionally conform to the PreDequeuer, PreHandler, and PostHandler
-// interfaces to further configure the behavior of the worker routine.
-type Handler interface {
-	// Handle processes a single record. The store provided by this method a store backed
-	// by the transaction that is locking the given record. If use of a database is necessary
-	// within this handler, other stores should take the underlying handler to keep work
-	// within the same transaction.
-	//
-	//     func (h *handler) Handle(ctx context.Context, tx workerutil.Store, record workerutil.Record) error {
-	//         myStore := h.myStore.With(tx) // combine store handles
-	//         myRecord := record.(MyType)   // convert type of record
-	//         // do processing ...
-	//         return nil
-	//     }
-	Handle(ctx context.Context, store Store, record Record) error
+func NewWorker(ctx context.Context, store Store, handler Handler, options WorkerOptions) *Worker {
+	return newWorker(ctx, store, handler, options, glock.NewRealClock())
 }
 
-// HandlerWithPreDequeue is an extension of the Handler interface.
-type HandlerWithPreDequeue interface {
-	Handler
+func newWorker(ctx context.Context, store Store, handler Handler, options WorkerOptions, clock glock.Clock) *Worker {
+	if options.Name == "" {
+		panic("no name supplied to github.com/sourcegraph/sourcegraph/internal/workerutil:newWorker")
+	}
 
-	// PreDequeue is called, if implemented, directly before a call to the store's Dequeue method.
-	// If this method returns false, then the current worker iteration is skipped and the next iteration
-	// will begin after waiting for the configured polling interval. Any SQL queries returned by this
-	// method will be supplied as additional conditions to the store's Dequeue method.
-	PreDequeue(ctx context.Context) (bool, []*sqlf.Query, error)
-}
+	if options.WorkerHostname == "" {
+		options.WorkerHostname = hostname.Get()
+	}
 
-// HandlerWithHooks is an extension of the Handler interface.
-//
-// Example use case:
-// The processor for LSIF uploads has a maximum budget based on input size. PreHandle will subtract
-// the input size (atomically) from the budget and PostHandle will restore the input size back to the
-// budget. The PreDequeue hook is also implemented to supply additional SQL conditions that ensures no
-// record with a larger input sizes than the current budget will be dequeued by the worker process.
-type HandlerWithHooks interface {
-	Handler
-
-	// PreHandle is called, if implemented, directly before a invoking the handler with the given
-	// record. This method is invoked before starting a handler goroutine - therefore, any expensive
-	// operations in this method will block the dequeue loop from proceeding.
-	PreHandle(ctx context.Context, record Record)
-
-	// PostHandle is called, if implemented, directly after the handler for the given record has
-	// completed. This method is invoked inside the handler goroutine. Note that if PreHandle and
-	// PostHandle both operate on shared data, that they will be operating on the data from different
-	// goroutines and it is up to the caller to properly synchronize access to it.
-	PostHandle(ctx context.Context, record Record)
-}
-
-type HandlerFunc func(ctx context.Context, store Store, record Record) error
-
-func (f HandlerFunc) Handle(ctx context.Context, store Store, record Record) error {
-	return f(ctx, store, record)
-}
-
-type WorkerMetrics struct {
-	HandleOperation *observation.Operation
-}
-
-func NewWorker(ctx context.Context, store Store, options WorkerOptions) *Worker {
-	return newWorker(ctx, store, options, glock.NewRealClock())
-}
-
-func newWorker(ctx context.Context, store Store, options WorkerOptions, clock glock.Clock) *Worker {
 	ctx, cancel := context.WithCancel(ctx)
 
 	handlerSemaphore := make(chan struct{}, options.NumHandlers)
@@ -108,12 +81,14 @@ func newWorker(ctx context.Context, store Store, options WorkerOptions, clock gl
 
 	return &Worker{
 		store:            store,
+		handler:          handler,
 		options:          options,
 		clock:            clock,
 		handlerSemaphore: handlerSemaphore,
 		ctx:              ctx,
 		cancel:           cancel,
 		finished:         make(chan struct{}),
+		runningIDSet:     newIDSet(),
 	}
 }
 
@@ -121,14 +96,42 @@ func newWorker(ctx context.Context, store Store, options WorkerOptions, clock gl
 func (w *Worker) Start() {
 	defer close(w.finished)
 
+	// Create a background routine that periodically writes the current time to the running records.
+	// This will keep the records claimed by the active worker for a small amount of time so that
+	// it will not be processed by a second worker concurrently.
+	go func() {
+		for {
+			select {
+			case <-w.ctx.Done():
+				return
+			case <-w.clock.After(w.options.HeartbeatInterval):
+			}
+
+			ids := w.runningIDSet.Slice()
+			knownIDs, err := w.store.Heartbeat(w.ctx, ids)
+			if err != nil {
+				log15.Error("Failed to refresh heartbeats", "name", w.options.Name, "ids", ids, "error", err)
+			}
+			knownIDsMap := map[int]struct{}{}
+			for _, id := range knownIDs {
+				knownIDsMap[id] = struct{}{}
+			}
+
+			for _, id := range ids {
+				if _, ok := knownIDsMap[id]; !ok {
+					w.runningIDSet.Remove(id)
+				}
+			}
+		}
+	}()
+
 loop:
 	for {
 		ok, err := w.dequeueAndHandle()
 		if err != nil {
-			for ex := err; ex != nil; ex = errors.Unwrap(ex) {
-				if err == w.ctx.Err() {
-					break loop
-				}
+			if w.ctx.Err() != nil && errors.Is(err, w.ctx.Err()) {
+				// If the error is due to the loop being shut down, just break
+				break loop
 			}
 
 			log15.Error("Failed to dequeue and handle record", "name", w.options.Name, "err", err)
@@ -165,8 +168,8 @@ func (w *Worker) Stop() {
 // will bubble up.
 func (w *Worker) dequeueAndHandle() (dequeued bool, err error) {
 	select {
-	// If we block here we are waiting for a handler to exit so that we
-	// do not exceed our configured concurrency limit.
+	// If we block here we are waiting for a handler to exit so that we do not
+	// exceed our configured concurrency limit.
 	case <-w.handlerSemaphore:
 	case <-w.ctx.Done():
 		return false, w.ctx.Err()
@@ -181,7 +184,7 @@ func (w *Worker) dequeueAndHandle() (dequeued bool, err error) {
 		}
 	}()
 
-	dequeueable, conditions, err := w.preDequeueHook()
+	dequeueable, extraDequeueArguments, err := w.preDequeueHook()
 	if err != nil {
 		return false, errors.Wrap(err, "Handler.PreDequeueHook")
 	}
@@ -191,7 +194,7 @@ func (w *Worker) dequeueAndHandle() (dequeued bool, err error) {
 	}
 
 	// Select a queued record to process and the transaction that holds it
-	record, tx, dequeued, err := w.store.Dequeue(w.ctx, conditions)
+	record, dequeued, err := w.store.Dequeue(w.ctx, w.options.WorkerHostname, extraDequeueArguments)
 	if err != nil {
 		return false, errors.Wrap(err, "store.Dequeue")
 	}
@@ -200,25 +203,38 @@ func (w *Worker) dequeueAndHandle() (dequeued bool, err error) {
 		return false, nil
 	}
 
-	log15.Info("Dequeued record for processing", "name", w.options.Name, "id", record.RecordID())
+	handleCtx, cancel := context.WithCancel(w.ctx)
+	// Register the record as running so it is included in heartbeat updates.
+	if !w.runningIDSet.Add(record.RecordID(), cancel) {
+		return false, ErrJobAlreadyExists
+	}
 
-	if hook, ok := w.options.Handler.(HandlerWithHooks); ok {
-		hook.PreHandle(w.ctx, record)
+	w.options.Metrics.numJobs.Inc()
+	log15.Debug("Dequeued record for processing", "name", w.options.Name, "id", record.RecordID())
+
+	if hook, ok := w.handler.(WithHooks); ok {
+		hook.PreHandle(handleCtx, record)
 	}
 
 	w.wg.Add(1)
 
 	go func() {
 		defer func() {
-			if hook, ok := w.options.Handler.(HandlerWithHooks); ok {
+			if hook, ok := w.handler.(WithHooks); ok {
+				// Don't use handleCtx here, the record is already not owned by
+				// this worker anymore at this point.
 				hook.PostHandle(w.ctx, record)
 			}
 
+			// Remove the record from the set of running jobs, so it is not included
+			// in heartbeat updates anymore.
+			defer w.runningIDSet.Remove(record.RecordID())
+			w.options.Metrics.numJobs.Dec()
 			w.handlerSemaphore <- struct{}{}
 			w.wg.Done()
 		}()
 
-		if err := w.handle(tx, record); err != nil {
+		if err := w.handle(handleCtx, record); err != nil {
 			log15.Error("Failed to finalize record", "name", w.options.Name, "err", err)
 		}
 	}()
@@ -226,45 +242,41 @@ func (w *Worker) dequeueAndHandle() (dequeued bool, err error) {
 	return true, nil
 }
 
-// handle processes the given record locked by the given transaction. This method returns an
-// error only if there is an issue committing the transaction - no handler errors will bubble
-// up.
-func (w *Worker) handle(tx Store, record Record) (err error) {
-	// Enable tracing on the context and trace the remainder of the operation including the
-	// transaction commit call in the following deferred function.
-	ctx, endOperation := w.options.Metrics.HandleOperation.With(ot.WithShouldTrace(w.ctx, true), &err, observation.Args{})
-	defer func() {
-		endOperation(1, observation.Args{})
-	}()
+// handle processes the given record. This method returns an error only if there is an issue updating
+// the record to a terminal state - no handler errors will bubble up.
+func (w *Worker) handle(ctx context.Context, record Record) (err error) {
+	ctx, endOperation := w.options.Metrics.operations.handle.With(ctx, &err, observation.Args{})
+	defer endOperation(1, observation.Args{})
 
-	defer func() {
-		// Notice that we will commit the transaction even on error from the handler
-		// function. We will only rollback the transaction if we fail to mark the job
-		// as completed or errored.
-		err = tx.Done(err)
-	}()
+	handleErr := w.handler.Handle(ctx, record)
 
-	if handleErr := w.options.Handler.Handle(ctx, tx, record); handleErr != nil {
-		if marked, markErr := tx.MarkErrored(ctx, record.RecordID(), handleErr.Error()); markErr != nil {
+	if errcode.IsNonRetryable(handleErr) {
+		if marked, markErr := w.store.MarkFailed(ctx, record.RecordID(), handleErr.Error()); markErr != nil {
+			return errors.Wrap(markErr, "store.MarkFailed")
+		} else if marked {
+			log15.Warn("Marked record as failed", "name", w.options.Name, "id", record.RecordID(), "err", handleErr)
+		}
+	} else if handleErr != nil {
+		if marked, markErr := w.store.MarkErrored(ctx, record.RecordID(), handleErr.Error()); markErr != nil {
 			return errors.Wrap(markErr, "store.MarkErrored")
 		} else if marked {
 			log15.Warn("Marked record as errored", "name", w.options.Name, "id", record.RecordID(), "err", handleErr)
 		}
 	} else {
-		if marked, markErr := tx.MarkComplete(ctx, record.RecordID()); markErr != nil {
+		if marked, markErr := w.store.MarkComplete(ctx, record.RecordID()); markErr != nil {
 			return errors.Wrap(markErr, "store.MarkComplete")
 		} else if marked {
-			log15.Info("Marked record as complete", "name", w.options.Name, "id", record.RecordID())
+			log15.Debug("Marked record as complete", "name", w.options.Name, "id", record.RecordID())
 		}
 	}
 
-	log15.Info("Handled record", "name", w.options.Name, "id", record.RecordID())
+	log15.Debug("Handled record", "name", w.options.Name, "id", record.RecordID())
 	return nil
 }
 
 // preDequeueHook invokes the handler's pre-dequeue hook if it exists.
-func (w *Worker) preDequeueHook() (bool, []*sqlf.Query, error) {
-	if o, ok := w.options.Handler.(HandlerWithPreDequeue); ok {
+func (w *Worker) preDequeueHook() (dequeueable bool, extraDequeueArguments interface{}, err error) {
+	if o, ok := w.handler.(WithPreDequeue); ok {
 		return o.PreDequeue(w.ctx)
 	}
 

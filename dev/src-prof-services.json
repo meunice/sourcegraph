@@ -5,10 +5,12 @@
   { "Name": "symbols", "Host": "127.0.0.1:6071" },
   { "Name": "repo-updater", "Host": "127.0.0.1:6074" },
   { "Name": "query-runner", "Host": "127.0.0.1:6067" },
-  { "Name": "replacer", "Host": "127.0.0.1:6076" },
-  { "Name": "precise-code-intel-bundle-manager", "Host": "127.0.0.1:6087" },
   { "Name": "precise-code-intel-worker", "Host": "127.0.0.1:6088" },
-  { "Name": "precise-code-intel-indexer", "Host": "127.0.0.1:6089" },
-  { "Name": "zoekt-indexserver", "Host": "127.0.0.1:6072" },
-  { "Name": "zoekt-webserver", "Host": "127.0.0.1:3070", "DefaultPath": "/debug/requests/" }
+  { "Name": "worker", "Host": "127.0.0.1:6089" },
+  { "Name": "executor-codeintel", "Host": "127.0.0.1:6092" },
+  { "Name": "executor-batches", "Host": "127.0.0.1:6093" },
+  { "Name": "zoekt-indexserver-0", "Host": "127.0.0.1:6072" },
+  { "Name": "zoekt-indexserver-1", "Host": "127.0.0.1:6073" },
+  { "Name": "zoekt-webserver-0", "Host": "127.0.0.1:3070", "DefaultPath": "/debug/requests/" },
+  { "Name": "zoekt-webserver-1", "Host": "127.0.0.1:3071", "DefaultPath": "/debug/requests/" }
 ]

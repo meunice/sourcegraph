@@ -2,11 +2,46 @@ package query
 
 var empty = struct{}{}
 
+// All field names.
+const (
+	FieldDefault            = ""
+	FieldCase               = "case"
+	FieldRepo               = "repo"
+	FieldRepoGroup          = "repogroup"
+	FieldFile               = "file"
+	FieldFork               = "fork"
+	FieldArchived           = "archived"
+	FieldLang               = "lang"
+	FieldType               = "type"
+	FieldRepoHasFile        = "repohasfile"
+	FieldRepoHasCommitAfter = "repohascommitafter"
+	FieldPatternType        = "patterntype"
+	FieldContent            = "content"
+	FieldVisibility         = "visibility"
+	FieldRev                = "rev"
+	FieldContext            = "context"
+
+	// For diff and commit search only:
+	FieldBefore    = "before"
+	FieldAfter     = "after"
+	FieldAuthor    = "author"
+	FieldCommitter = "committer"
+	FieldMessage   = "message"
+
+	// Temporary experimental fields:
+	FieldIndex     = "index"
+	FieldCount     = "count" // Searches that specify `count:` will fetch at least that number of results, or the full result set
+	FieldTimeout   = "timeout"
+	FieldCombyRule = "rule"
+	FieldSelect    = "select"
+)
+
 var allFields = map[string]struct{}{
 	FieldCase:               empty,
 	FieldRepo:               empty,
 	"r":                     empty,
 	FieldRepoGroup:          empty,
+	FieldContext:            empty,
 	"g":                     empty,
 	FieldFile:               empty,
 	"f":                     empty,
@@ -18,6 +53,7 @@ var allFields = map[string]struct{}{
 	FieldType:               empty,
 	FieldPatternType:        empty,
 	FieldContent:            empty,
+	FieldVisibility:         empty,
 	FieldRepoHasFile:        empty,
 	FieldRepoHasCommitAfter: empty,
 	FieldBefore:             empty,
@@ -31,9 +67,31 @@ var allFields = map[string]struct{}{
 	"msg":                   empty,
 	FieldIndex:              empty,
 	FieldCount:              empty,
-	FieldStable:             empty,
-	FieldMax:                empty,
 	FieldTimeout:            empty,
-	FieldReplace:            empty,
 	FieldCombyRule:          empty,
+	FieldRev:                empty,
+	"revision":              empty,
+	FieldSelect:             empty,
+}
+
+var aliases = map[string]string{
+	"r":        FieldRepo,
+	"g":        FieldRepoGroup,
+	"f":        FieldFile,
+	"l":        FieldLang,
+	"language": FieldLang,
+	"since":    FieldAfter,
+	"until":    FieldBefore,
+	"m":        FieldMessage,
+	"msg":      FieldMessage,
+	"revision": FieldRev,
+}
+
+// resolveFieldAlias resolves an aliased field like `r:` to its canonical name
+// like `repo:`.
+func resolveFieldAlias(field string) string {
+	if canonical, ok := aliases[field]; ok {
+		return canonical
+	}
+	return field
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"math"
 	"net/http"
@@ -38,7 +37,7 @@ var (
 	})
 	reposAlreadyDoneCounter = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "ghe_feeder_skipped",
-		Help: "The total number of repos already done in previous runs (found in feeder.db)",
+		Help: "The total number of repos already done in previous runs (found in feeder.database)",
 	})
 
 	remainingWorkGauge = promauto.NewGauge(prometheus.GaugeOpts{
@@ -50,7 +49,7 @@ var (
 func main() {
 	admin := flag.String("admin", "", "(required) destination GHE admin name")
 	token := flag.String("token", os.Getenv("GITHUB_TOKEN"), "(required) GitHub personal access token for the destination GHE instance")
-	progressFilepath := flag.String("progress", "feeder.db", "path to a sqlite DB recording the progress made in the feeder (created if it doesn't exist)")
+	progressFilepath := flag.String("progress", "feeder.database", "path to a sqlite DB recording the progress made in the feeder (created if it doesn't exist)")
 	baseURL := flag.String("baseURL", "", "(required) base URL of GHE instance to feed")
 	uploadURL := flag.String("uploadURL", "", "upload URL of GHE instance to feed")
 	numWorkers := flag.Int("numWorkers", 20, "number of workers")
@@ -84,7 +83,7 @@ func main() {
 	}
 
 	if len(*scratchDir) == 0 {
-		d, err := ioutil.TempDir("", "ghe-feeder")
+		d, err := os.MkdirTemp("", "ghe-feeder")
 		if err != nil {
 			log15.Error("failed to create scratch dir", "error", err)
 			os.Exit(1)

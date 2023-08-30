@@ -3,13 +3,14 @@ package registry
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"time"
 
+	"github.com/cockroachdb/errors"
+	"github.com/jackc/pgconn"
 	"github.com/keegancsmith/sqlf"
-	"github.com/lib/pq"
-	"github.com/sourcegraph/sourcegraph/internal/db/dbconn"
+
+	"github.com/sourcegraph/sourcegraph/internal/database/dbconn"
 )
 
 // dbRelease describes a release of an extension in the extension registry.
@@ -57,10 +58,9 @@ RETURNING id
 `,
 		release.RegistryExtensionID, release.CreatorUserID, release.ReleaseVersion, release.ReleaseTag, release.Manifest, release.Bundle, release.SourceMap,
 	).Scan(&id); err != nil {
-		if pqErr, ok := err.(*pq.Error); ok {
-			if pqErr.Message == "invalid input syntax for type json" {
-				return 0, errInvalidJSONInManifest
-			}
+		var e *pgconn.PgError
+		if errors.As(err, &e) && e.Message == "invalid input syntax for type json" {
+			return 0, errInvalidJSONInManifest
 		}
 		return 0, err
 	}

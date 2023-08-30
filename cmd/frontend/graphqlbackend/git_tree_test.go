@@ -2,25 +2,24 @@ package graphqlbackend
 
 import (
 	"context"
+	"io/fs"
 	"os"
 	"testing"
 
-	"github.com/graph-gophers/graphql-go/gqltesting"
-
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/backend"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/types"
 	"github.com/sourcegraph/sourcegraph/internal/api"
-	"github.com/sourcegraph/sourcegraph/internal/db"
+	"github.com/sourcegraph/sourcegraph/internal/database"
+	"github.com/sourcegraph/sourcegraph/internal/types"
 	"github.com/sourcegraph/sourcegraph/internal/vcs/git"
 	"github.com/sourcegraph/sourcegraph/internal/vcs/util"
 )
 
 func TestGitTree(t *testing.T) {
 	resetMocks()
-	db.Mocks.ExternalServices.List = func(opt db.ExternalServicesListOptions) ([]*types.ExternalService, error) {
+	database.Mocks.ExternalServices.List = func(opt database.ExternalServicesListOptions) ([]*types.ExternalService, error) {
 		return nil, nil
 	}
-	db.Mocks.Repos.MockGetByName(t, "github.com/gorilla/mux", 2)
+	database.Mocks.Repos.MockGetByName(t, "github.com/gorilla/mux", 2)
 	backend.Mocks.Repos.ResolveRev = func(ctx context.Context, repo *types.Repo, rev string) (api.CommitID, error) {
 		if repo.ID != 2 || rev != exampleCommitSHA1 {
 			t.Error("wrong arguments to Repos.ResolveRev")
@@ -29,7 +28,7 @@ func TestGitTree(t *testing.T) {
 	}
 	backend.Mocks.Repos.MockGetCommit_Return_NoCheck(t, &git.Commit{ID: exampleCommitSHA1})
 
-	git.Mocks.Stat = func(commit api.CommitID, path string) (os.FileInfo, error) {
+	git.Mocks.Stat = func(commit api.CommitID, path string) (fs.FileInfo, error) {
 		if string(commit) != exampleCommitSHA1 {
 			t.Errorf("got commit %q, want %q", commit, exampleCommitSHA1)
 		}
@@ -38,7 +37,7 @@ func TestGitTree(t *testing.T) {
 		}
 		return &util.FileInfo{Name_: path, Mode_: os.ModeDir}, nil
 	}
-	git.Mocks.ReadDir = func(commit api.CommitID, name string, recurse bool) ([]os.FileInfo, error) {
+	git.Mocks.ReadDir = func(commit api.CommitID, name string, recurse bool) ([]fs.FileInfo, error) {
 		if string(commit) != exampleCommitSHA1 {
 			t.Errorf("got commit %q, want %q", commit, exampleCommitSHA1)
 		}
@@ -48,7 +47,7 @@ func TestGitTree(t *testing.T) {
 		if recurse {
 			t.Error("got recurse == false, want true")
 		}
-		return []os.FileInfo{
+		return []fs.FileInfo{
 			&util.FileInfo{Name_: name + "/testDirectory", Mode_: os.ModeDir},
 			&util.FileInfo{Name_: name + "/Geoffrey's random queries.32r242442bf", Mode_: os.ModeDir},
 			&util.FileInfo{Name_: name + "/testFile", Mode_: 0},
@@ -57,7 +56,7 @@ func TestGitTree(t *testing.T) {
 	}
 	defer git.ResetMocks()
 
-	gqltesting.RunTests(t, []*gqltesting.Test{
+	RunTests(t, []*Test{
 		{
 			Schema: mustParseGraphQLSchema(t),
 			Query: `

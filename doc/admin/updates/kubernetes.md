@@ -1,13 +1,152 @@
 # Updating a Kubernetes Sourcegraph instance
 
-This document describes the exact changes needed to update a Kubernetes Sourcegraph instance.
-Follow the [recommended method](../install/kubernetes/update.md) of upgrading a Kubernetes cluster.
+This document describes the exact changes needed to update a Kubernetes Sourcegraph instance. Follow
+the [recommended method](../install/kubernetes/update.md) of upgrading a Kubernetes cluster.
 
-**Always refer to this page before upgrading Sourcegraph,** as it comprehensively describes the steps needed to upgrade, and any manual migration steps you must perform.
+A new version of Sourcegraph is released every month on the **20th** (with patch releases in between, released as
+needed). Check the [Sourcegraph blog](https://about.sourcegraph.com/blog) or the site admin updates page to learn about
+updates. We actively maintain the two most recent monthly releases of Sourcegraph.
+
+> ⚠️ **Regardless of your deployment type:** ⚠️
+> <br>Upgrade one version at a time, e.g. v3.26 --> v3.27 --> v3.28.
+> <br>Patches, e.g. vX.X.4 vs. vX.X.5, do not have to be adopted when moving between vX.X versions.
+
+> ⚠️ **Regardless of your deployment type:** ⚠️
+> <br>Check your <a href="../migrations">out of band migration status</a> prior to upgrade to avoid a necessary rollback while the migration finishes.
+
+**Always refer to this page before upgrading Sourcegraph,** as it comprehensively describes the steps needed to upgrade,
+and any manual migration steps you must perform.
+
+<!-- GENERATE UPGRADE GUIDE ON RELEASE (release tooling uses this to add entries) -->
+
+## 3.29 -> 3.30.1
+
+**⚠️ Users are advised to wait on upgrading to any 3.30 release until [#23288](https://github.com/sourcegraph/sourcegraph/issues/23288) is resolved**
+
+This upgrade removes the `non-root` overlay, in favor of using only the `non-privileged` overlay for deploying Sourcegraph in secure environments. If you were
+previously deploying using the `non-root` overlay, you should now generate overlays using the `non-privileged` overlay.
+
+No other manual migration is required, follow the [standard upgrade method](../install/kubernetes/update.md) to upgrade your
+deployment.
+
+*How smooth was this upgrade process for you? You can give us your feedback on this upgrade by filling out [this feedback form](https://share.hsforms.com/1aGeG7ALQQEGO6zyfauIiCA1n7ku?update_version=3.29).*
+
+## 3.28 -> 3.29
+
+This upgrade adds a new `worker` service that runs a number of background jobs that were previously run in the `frontend` service. See [notes on deploying workers](../workers.md#deploying-workers) for additional details. Good initial values for CPU and memory resources allocated to this new service should match the `frontend` service.
+
+*How smooth was this upgrade process for you? You can give us your feedback on this upgrade by filling out [this feedback form](https://share.hsforms.com/1aGeG7ALQQEGO6zyfauIiCA1n7ku?update_version=3.28).*
+
+## 3.27 -> 3.28
+
+- All Sourcegraph images now have a registry prefix. [#2901](https://github.com/sourcegraph/deploy-sourcegraph/pull/2901)
+- The memory requirements for `redis-cache` and `redis-store` have been increased by 1GB. See https://github.com/sourcegraph/deploy-sourcegraph/pull/2898 for more context.
+
+*How smooth was this upgrade process for you? You can give us your feedback on this upgrade by filling out [this feedback form](https://share.hsforms.com/1aGeG7ALQQEGO6zyfauIiCA1n7ku?update_version=3.27).*
+
+## 3.26 -> 3.27
+
+> Warning: ⚠️ Sourcegraph 3.27 now requires **Postgres 12+**.
+
+If you are using an external
+database, [upgrade your database](https://docs.sourcegraph.com/admin/postgres#upgrading-external-postgresql-instances)
+to Postgres 12 or above prior to upgrading Sourcegraph. No action is required if you are using the supplied database
+images.
+> **Note**: The Postgres 12 database migration scales with the size of your database, and the resources provided to the container.
+> Expect to have downtime relative to the size of your database. Additionally, you must ensure that have enough storage
+> space to accommodate the migration. A rough guide would be 2x the current on-disk database size
+
+> Warning: ⚠️ We have updated the default replicas for `sourcegraph-frontend` and `precise-code-intel-worker` to `2`. If you use a custom value, make sure you do not merge the replica change.
+
+Afterwards, follow the [standard upgrade method](../install/kubernetes/update.md) to upgrade your deployment.
+
+*How smooth was this upgrade process for you? You can give us your feedback on this upgrade by filling
+out [this feedback form](https://share.hsforms.com/1aGeG7ALQQEGO6zyfauIiCA1n7ku?update_version=3.26).*
+
+## 3.25 -> 3.26
+
+No manual migration required, follow the [standard upgrade method](../install/kubernetes/update.md) to upgrade your
+deployment.
+
+> NOTE: ⚠️ From **3.27** onwards we will only support PostgreSQL versions **starting from 12**.
+
+*How smooth was this upgrade process for you? You can give us your feedback on this upgrade by filling out [this feedback form](https://share.hsforms.com/1aGeG7ALQQEGO6zyfauIiCA1n7ku?update_version=3.25).*
+
+## 3.24 -> 3.25
+
+- Go `1.15` introduced changes to SSL/TLS connection validation which requires certificates to include a `SAN`. This field was not included in older certificates and clients relied on the `CN` field. You might see an error like `x509: certificate relies on legacy Common Name field`. We recommend that customers using Sourcegraph with an external database and and connecting to it using SSL/TLS check whether the certificate is up to date.
+  - AWS RDS customers please reference [AWS' documentation on updating the SSL/TLS certificate](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.SSL-certificate-rotation.html) for steps to rotate your certificate.
+
+
+*How smooth was this upgrade process for you? You can give us your feedback on this upgrade by filling out [this feedback form](https://share.hsforms.com/1aGeG7ALQQEGO6zyfauIiCA1n7ku?update_version=3.24).*
+
+## 3.23 -> 3.24
+
+No manual migration required, follow the [standard upgrade method](../install/kubernetes/update.md) to upgrade your deployment.
+
+*How smooth was this upgrade process for you? You can give us your feedback on this upgrade by filling out [this feedback form](https://share.hsforms.com/1aGeG7ALQQEGO6zyfauIiCA1n7ku?update_version=3.23).*
+
+## 3.22 -> 3.23
+
+No manual migration is required, follow the [standard upgrade method](../install/kubernetes/update.md) to upgrade your deployment.
+
+*How smooth was this upgrade process for you? You can give us your feedback on this upgrade by filling out [this feedback form](https://share.hsforms.com/1aGeG7ALQQEGO6zyfauIiCA1n7ku?update_version=3.22).*
+
+## 3.21 -> 3.22
+
+No manual migration is required, follow the [standard upgrade method](../install/kubernetes/update.md) to upgrade your deployment.
+
+This upgrade removes the `code intel bundle manager`. This service has been deprecated and all references to it have been removed.
+
+This upgrade also adds a MinIO container that doesn't require any custom configuration. You can find more detailed documentation in https://docs.sourcegraph.com/admin/external_services/object_storage.
+
+*How smooth was this upgrade process for you? You can give us your feedback on this upgrade by filling out [this feedback form](https://share.hsforms.com/1aGeG7ALQQEGO6zyfauIiCA1n7ku?update_version=3.21).*
+
+## 3.20 -> 3.21
+
+Follow the [standard upgrade method](../install/kubernetes/update.md) to upgrade your deployment.
+
+This release introduces a second database instance, `codeintel-db`. If you have configured Sourcegraph with an external database, then update the `CODEINTEL_PG*` environment variables to point to a new external database as described in the [external database documentation](../external_services/postgres.md). Again, these must not point to the same database or the Sourcegraph instance will refuse to start.
+
+### If you wish to keep existing LSIF data
+
+> Warning: **Do not upgrade out of the 3.21.x release branch** until you have seen the log message indicating the completion of the LSIF data migration, or verified that the `/lsif-storage/dbs` directory on the precise-code-intel-bundle-manager volume is empty. Otherwise, you risk data loss for precise code intelligence.
+
+If you had LSIF data uploaded prior to upgrading to 3.21.0, there is a background migration that moves all existing LSIF data into the `codeintel-db` upon upgrade. Once this process completes, the `/lsif-storage/dbs` directory on the precise-code-intel-bundle-manager volume should be empty, and the bundle manager should print the following log message:
+
+> Migration to Postgres has completed. All existing LSIF bundles have moved to the path /lsif-storage/db-backups and can be removed from the filesystem to reclaim space.
+
+**Wait for the above message to be printed in `docker logs precise-code-intel-bundle-manager` before upgrading to the next Sourcegraph version**.
+
+*How smooth was this upgrade process for you? You can give us your feedback on this upgrade by filling out [this feedback form](https://share.hsforms.com/1aGeG7ALQQEGO6zyfauIiCA1n7ku?update_version=3.21).*
+
+
+## 3.20
+
+No manual migration is required, follow the [standard upgrade method](../install/kubernetes/update.md) to upgrade your deployment.
+
+*How smooth was this upgrade process for you? You can give us your feedback on this upgrade by filling out [this feedback form](https://share.hsforms.com/1aGeG7ALQQEGO6zyfauIiCA1n7ku?update_version=3.20).*
+
+## 3.19
+
+No manual migration is required, follow the [standard upgrade method](../install/kubernetes/update.md) to upgrade your deployment.
+
+> Warning: If you use an overlay that does not reference one of the provided overlays, please add `- ../bases/pvcs` as an additional base
+to your `kustomization.yaml` file. Otherwise the PVCs could be pruned if `kubectl apply -prune` is used.
+
+*How smooth was this upgrade process for you? You can give us your feedback on this upgrade by filling out [this feedback form](https://share.hsforms.com/1aGeG7ALQQEGO6zyfauIiCA1n7ku?update_version=3.19).*
+
+## 3.18
+
+No manual migration is required, follow the [standard upgrade method](../install/kubernetes/update.md) to upgrade your deployment.
+
+*How smooth was this upgrade process for you? You can give us your feedback on this upgrade by filling out [this feedback form](https://share.hsforms.com/1aGeG7ALQQEGO6zyfauIiCA1n7ku?update_version=3.18).*
 
 ## 3.17
 
 No manual migration is required, follow the [standard upgrade method](../install/kubernetes/update.md) to upgrade your deployment.
+
+*How smooth was this upgrade process for you? You can give us your feedback on this upgrade by filling out [this feedback form](https://share.hsforms.com/1aGeG7ALQQEGO6zyfauIiCA1n7ku?update_version=3.17).*
 
 ## 3.16
 
@@ -20,8 +159,10 @@ Note: The following deployments have had their `strategy` changed from `rolling`
 - pgsql
 - precise-code-intel-bundle-manager
 - prometheus
-  
+
 This change was made to avoid two pods writing to the same volume and causing corruption. No special action is needed to apply the change.
+
+*How smooth was this upgrade process for you? You can give us your feedback on this upgrade by filling out [this feedback form](https://share.hsforms.com/1aGeG7ALQQEGO6zyfauIiCA1n7ku?update_version=3.16).*
 
 ## 3.15
 
@@ -40,7 +181,7 @@ If you have previously uploaded LSIF precise code intelligence data and wish to 
 
 **Skipping the migration**
 
-If you choose not to migrate the data, Sourcegraph will use basic code intelligence until you upload LSIF data again.
+If you choose not to migrate the data, Sourcegraph will use search-based code intelligence until you upload LSIF data again.
 
 You may run the following commands to remove the now unused resources:
 
@@ -119,7 +260,7 @@ In 3.9 `indexed-search` is migrated from a Kubernetes [Deployment](https://kuber
 
 ``` bash
 # Set the reclaim policy to retain so when we delete the volume claim the volume is not deleted.
-kubectl patch pv -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}' $(kubectl get pv -o json | jq -r '.items[] | select(.spec.claimRef.name == "indexed-search").metadata.name') 
+kubectl patch pv -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}' $(kubectl get pv -o json | jq -r '.items[] | select(.spec.claimRef.name == "indexed-search").metadata.name')
 
 # Stop indexed search so we can migrate it. This means indexed search will be down!
 kubectl scale deploy/indexed-search --replicas=0
@@ -128,7 +269,7 @@ kubectl scale deploy/indexed-search --replicas=0
 kubectl delete pvc indexed-search
 
 # Move the claim to data-indexed-search-0, which is the name created by stateful set.
-kubectl patch pv -p '{"spec":{"claimRef":{"name":"data-indexed-search-0","uuid":null}}}' $(kubectl get pv -o json | jq -r '.items[] | select(.spec.claimRef.name == "indexed-search").metadata.name') 
+kubectl patch pv -p '{"spec":{"claimRef":{"name":"data-indexed-search-0","uuid":null}}}' $(kubectl get pv -o json | jq -r '.items[] | select(.spec.claimRef.name == "indexed-search").metadata.name')
 
 # Create the stateful set
 kubectl apply -f base/indexed-search/indexed-search.StatefulSet.yaml
@@ -154,7 +295,7 @@ In Sourcegraph 3.0 all site configuration has been moved out of the `config-file
 
 After running 3.0, you should visit the configuration page (`/site-admin/configuration`) and [the management console](https://docs.sourcegraph.com/admin/management_console) and ensure that your configuration is as expected. In some rare cases, automatic migration may not be able to properly carry over some settings and you may need to reconfigure them.
 
-### `sourcegraph-frontend` service type 
+### `sourcegraph-frontend` service type
 
 The type of the `sourcegraph-frontend` service ([base/frontend/sourcegraph-frontend.Service.yaml](https://github.com/sourcegraph/deploy-sourcegraph/blob/master/base/frontend/sourcegraph-frontend.Service.yaml)) has changed
 from `NodePort` to `ClusterIP`. Directly applying this change [will

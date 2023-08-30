@@ -7,7 +7,8 @@ import (
 
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/backend"
 	"github.com/sourcegraph/sourcegraph/internal/conf"
-	"github.com/sourcegraph/sourcegraph/internal/db"
+	"github.com/sourcegraph/sourcegraph/internal/database"
+	"github.com/sourcegraph/sourcegraph/internal/database/dbutil"
 )
 
 func (r *siteResolver) NeedsRepositoryConfiguration(ctx context.Context) (bool, error) {
@@ -17,37 +18,29 @@ func (r *siteResolver) NeedsRepositoryConfiguration(ctx context.Context) (bool, 
 
 	// 🚨 SECURITY: The site alerts may contain sensitive data, so only site
 	// admins may view them.
-	if err := backend.CheckCurrentUserIsSiteAdmin(ctx); err != nil {
+	if err := backend.CheckCurrentUserIsSiteAdmin(ctx, r.db); err != nil {
 		// TODO(dax): This should return err once the site flags query is fixed for users
 		return false, nil
 	}
 
-	return needsRepositoryConfiguration(ctx)
+	return needsRepositoryConfiguration(ctx, r.db)
 }
 
-func needsRepositoryConfiguration(ctx context.Context) (bool, error) {
-	kinds := make([]string, 0, len(db.ExternalServiceKinds))
-	for kind, config := range db.ExternalServiceKinds {
+func needsRepositoryConfiguration(ctx context.Context, db dbutil.DB) (bool, error) {
+	kinds := make([]string, 0, len(database.ExternalServiceKinds))
+	for kind, config := range database.ExternalServiceKinds {
 		if config.CodeHost {
 			kinds = append(kinds, kind)
 		}
 	}
 
-	count, err := db.ExternalServices.Count(ctx, db.ExternalServicesListOptions{
+	count, err := database.ExternalServices(db).Count(ctx, database.ExternalServicesListOptions{
 		Kinds: kinds,
 	})
 	if err != nil {
 		return false, err
 	}
 	return count == 0, nil
-}
-
-func (r *siteResolver) NoRepositoriesEnabled(ctx context.Context) (bool, error) {
-	// With 3.4 the Enabled/Disabled fields on repositories have been
-	// deprecated with the result being that all repositories are "enabled" by
-	// default.
-	// So instead of removing this flag and breaking the API we always return false
-	return false, nil
 }
 
 func (*siteResolver) DisableBuiltInSearches() bool {
@@ -70,7 +63,7 @@ func (r *siteResolver) FreeUsersExceeded(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 
-	userCount, err := db.Users.Count(ctx, nil)
+	userCount, err := database.Users(r.db).Count(ctx, nil)
 	if err != nil {
 		return false, err
 	}

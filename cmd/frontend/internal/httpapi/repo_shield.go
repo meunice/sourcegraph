@@ -4,10 +4,11 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/cockroachdb/errors"
 	"github.com/gorilla/mux"
-	"github.com/pkg/errors"
+
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/backend"
-	"github.com/sourcegraph/sourcegraph/internal/routevar"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/routevar"
 )
 
 // NOTE: Keep in sync with services/backend/httpapi/repo_shield.go

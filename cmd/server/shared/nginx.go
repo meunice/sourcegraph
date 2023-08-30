@@ -2,15 +2,13 @@ package shared
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
+
 	"github.com/sourcegraph/sourcegraph/cmd/server/shared/assets"
 )
-
-var nginxConf = assets.MustAsset("nginx.conf")
 
 // nginxProcFile will return a procfile entry for nginx, as well as setup
 // configuration for it.
@@ -34,14 +32,14 @@ func nginxProcFile() (string, error) {
 func nginxWriteFiles(configDir string) (string, error) {
 	// Check we can read the config
 	path := filepath.Join(configDir, "nginx.conf")
-	_, err := ioutil.ReadFile(path)
+	_, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
 		return "", err
 	}
 
 	// Does not exist
 	if err != nil {
-		err = ioutil.WriteFile(path, nginxConf, 0600)
+		err = os.WriteFile(path, []byte(assets.NginxConf), 0600)
 		if err != nil {
 			return "", err
 		}
@@ -50,16 +48,19 @@ func nginxWriteFiles(configDir string) (string, error) {
 	// We always write the files in the nginx directory, since those are
 	// controlled by Sourcegraph and can change between versions.
 	nginxDir := filepath.Join(configDir, "nginx")
-	if err = os.MkdirAll(nginxDir, 0755); err != nil {
+	if err := os.MkdirAll(nginxDir, 0755); err != nil {
 		return "", err
 	}
-	includeConfs, err := assets.AssetDir("nginx")
+	includeConfs, err := assets.NginxDir.ReadDir("nginx")
 	if err != nil {
 		return "", err
 	}
 	for _, p := range includeConfs {
-		data := assets.MustAsset("nginx/" + p)
-		err = ioutil.WriteFile(filepath.Join(nginxDir, p), data, 0600)
+		data, err := assets.NginxDir.ReadFile("nginx/" + p.Name())
+		if err != nil {
+			return "", err
+		}
+		err = os.WriteFile(filepath.Join(nginxDir, p.Name()), data, 0600)
 		if err != nil {
 			return "", err
 		}

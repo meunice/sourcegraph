@@ -2,17 +2,17 @@ package productsubscription
 
 import (
 	"context"
-	"fmt"
 	"time"
 
-	"github.com/pkg/errors"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/backend"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/graphqlbackend"
-	"github.com/sourcegraph/sourcegraph/enterprise/cmd/frontend/internal/dotcom/billing"
+	"github.com/cockroachdb/errors"
 	"github.com/stripe/stripe-go"
 	"github.com/stripe/stripe-go/invoice"
 	"github.com/stripe/stripe-go/plan"
 	"github.com/stripe/stripe-go/sub"
+
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/backend"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/graphqlbackend"
+	"github.com/sourcegraph/sourcegraph/enterprise/cmd/frontend/internal/dotcom/billing"
 )
 
 type productSubscriptionPreviewInvoice struct {
@@ -41,7 +41,7 @@ func isDowngradeRequiringManualIntervention(beforeUserCount int32, beforePlanPri
 }
 
 func userCountExceedsPlanMaxError(userCount, max int32) error {
-	return fmt.Errorf("user count (%d) exceeds maximum allowed in this plan (%d)", userCount, max)
+	return errors.Errorf("user count (%d) exceeds maximum allowed in this plan (%d)", userCount, max)
 }
 
 func (r *productSubscriptionPreviewInvoice) BeforeInvoiceItem() graphqlbackend.ProductSubscriptionInvoiceItem {
@@ -55,13 +55,13 @@ func (r *productSubscriptionPreviewInvoice) AfterInvoiceItem() graphqlbackend.Pr
 	return r.after
 }
 
-func (ProductSubscriptionLicensingResolver) PreviewProductSubscriptionInvoice(ctx context.Context, args *graphqlbackend.PreviewProductSubscriptionInvoiceArgs) (graphqlbackend.ProductSubscriptionPreviewInvoice, error) {
+func (r ProductSubscriptionLicensingResolver) PreviewProductSubscriptionInvoice(ctx context.Context, args *graphqlbackend.PreviewProductSubscriptionInvoiceArgs) (graphqlbackend.ProductSubscriptionPreviewInvoice, error) {
 	// Support previewing an invoice with or without a customer ID.
 	var custID string
 	var accountUserID *int32
 	if args.Account != nil {
 		// There is a customer ID given.
-		accountUser, err := graphqlbackend.UserByID(ctx, *args.Account)
+		accountUser, err := graphqlbackend.UserByID(ctx, r.DB, *args.Account)
 		if err != nil {
 			return nil, err
 		}
@@ -73,7 +73,7 @@ func (ProductSubscriptionLicensingResolver) PreviewProductSubscriptionInvoice(ct
 		}
 		// 🚨 SECURITY: Users may only preview invoices for their own product subscriptions. Site admins
 		// may preview invoices for all product subscriptions.
-		if err := backend.CheckSiteAdminOrSameUser(ctx, *accountUserID); err != nil {
+		if err := backend.CheckSiteAdminOrSameUser(ctx, r.DB, *accountUserID); err != nil {
 			return nil, err
 		}
 	} else {
@@ -125,13 +125,13 @@ func (ProductSubscriptionLicensingResolver) PreviewProductSubscriptionInvoice(ct
 		//
 		// When updating an existing subscription, craft the params to replace the existing subscription
 		// item (otherwise the invoice would include both the existing and updated subscription items).
-		subToUpdate, err := productSubscriptionByID(ctx, *args.SubscriptionToUpdate)
+		subToUpdate, err := productSubscriptionByID(ctx, r.DB, *args.SubscriptionToUpdate)
 		if err != nil {
 			return nil, err
 		}
 		// 🚨 SECURITY: Only site admins and the subscription's account owner may preview invoices
 		// for product subscriptions.
-		if err := backend.CheckSiteAdminOrSameUser(ctx, subToUpdate.v.UserID); err != nil {
+		if err := backend.CheckSiteAdminOrSameUser(ctx, r.DB, subToUpdate.v.UserID); err != nil {
 			return nil, err
 		}
 

@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	"github.com/inconshreveable/log15"
+
 	"github.com/sourcegraph/sourcegraph/cmd/gitserver/server"
 	"github.com/sourcegraph/sourcegraph/internal/api"
 	"github.com/sourcegraph/sourcegraph/internal/gitserver"
@@ -52,21 +52,29 @@ func init() {
 		log.Fatalf("listen failed: %s", err)
 	}
 
-	root, err = ioutil.TempDir("", "test")
+	root, err = os.MkdirTemp("", "test")
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	srv := &http.Server{Handler: (&server.Server{
-		ReposDir: filepath.Join(root, "repos"),
-	}).Handler()}
+	srv := &http.Server{
+		Handler: (&server.Server{
+			ReposDir: filepath.Join(root, "repos"),
+			GetRemoteURLFunc: func(ctx context.Context, name api.RepoName) (string, error) {
+				return filepath.Join(root, "remotes", string(name)), nil
+			},
+			GetVCSSyncer: func(ctx context.Context, name api.RepoName) (server.VCSSyncer, error) {
+				return &server.GitRepoSyncer{}, nil
+			},
+		}).Handler(),
+	}
 	go func() {
 		if err := srv.Serve(l); err != nil {
 			log.Fatal(err)
 		}
 	}()
 
-	gitserver.DefaultClient.Addrs = func(ctx context.Context) []string {
+	gitserver.DefaultClient.Addrs = func() []string {
 		return []string{l.Addr().String()}
 	}
 }
@@ -94,7 +102,7 @@ func InitGitRepository(t testing.TB, cmds ...string) string {
 	if err := os.MkdirAll(remotes, 0700); err != nil {
 		t.Fatal(err)
 	}
-	dir, err := ioutil.TempDir(remotes, t.Name())
+	dir, err := os.MkdirTemp(remotes, strings.ReplaceAll(t.Name(), "/", "__"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,12 +125,14 @@ func GitCommand(dir, name string, args ...string) *exec.Cmd {
 
 // MakeGitRepository calls initGitRepository to create a new Git repository and returns a handle to
 // it.
-func MakeGitRepository(t testing.TB, cmds ...string) gitserver.Repo {
+func MakeGitRepository(t testing.TB, cmds ...string) api.RepoName {
 	t.Helper()
 	dir := InitGitRepository(t, cmds...)
-	repo := gitserver.Repo{Name: api.RepoName(filepath.Base(dir)), URL: dir}
-	if _, err := gitserver.DefaultClient.RequestRepoUpdate(context.Background(), repo, 0); err != nil {
+	repo := api.RepoName(filepath.Base(dir))
+	if resp, err := gitserver.DefaultClient.RequestRepoUpdate(context.Background(), repo, 0); err != nil {
 		t.Fatal(err)
+	} else if resp.Error != "" {
+		t.Fatal(resp.Error)
 	}
 	return repo
 }

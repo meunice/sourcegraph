@@ -1,12 +1,13 @@
 package version
 
 import (
-	"errors"
-	"fmt"
+	"expvar"
 	"math"
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/cockroachdb/errors"
 )
 
 const devVersion = "0.0.0+dev"                              // version string for unreleased development builds
@@ -17,6 +18,11 @@ var devTimestamp = strconv.FormatInt(time.Now().Unix(), 10) // build timestamp f
 //
 // The version may not be semver-compatible, e.g. `insiders` or `65769_2020-06-05_9bd91a3`.
 var version = devVersion
+
+func init() {
+	exportedVersion := expvar.NewString("sourcegraph.version")
+	exportedVersion.Set(version)
+}
 
 // Version returns the version string configured at build time.
 func Version() string {
@@ -47,7 +53,7 @@ var timestamp = devTimestamp
 func HowLongOutOfDate(now time.Time) (int, error) {
 	buildUnixTimestamp, err := strconv.ParseInt(timestamp, 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("unable to parse version build timestamp: %w", err)
+		return 0, errors.Errorf("unable to parse version build timestamp: %w", err)
 	}
 	buildTime := time.Unix(buildUnixTimestamp, 0)
 

@@ -11,25 +11,34 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/cockroachdb/errors"
+	"github.com/inconshreveable/log15"
 	"github.com/sourcegraph/go-diff/diff"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/backend"
+
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/graphqlbackend/graphqlutil"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/highlight"
 	"github.com/sourcegraph/sourcegraph/internal/api"
-	"github.com/sourcegraph/sourcegraph/internal/gitserver"
-	"github.com/sourcegraph/sourcegraph/internal/highlight"
+	"github.com/sourcegraph/sourcegraph/internal/database/dbutil"
 	"github.com/sourcegraph/sourcegraph/internal/vcs/git"
 )
-
-type RepositoryComparisonConnectionResolver interface {
-	Nodes(ctx context.Context) ([]*RepositoryComparisonResolver, error)
-	TotalCount(ctx context.Context) (int32, error)
-	PageInfo(ctx context.Context) (*graphqlutil.PageInfo, error)
-}
 
 type RepositoryComparisonInput struct {
 	Base         *string
 	Head         *string
 	FetchMissing bool
+}
+
+type FileDiffsConnectionArgs struct {
+	First *int32
+	After *string
+}
+
+type RepositoryComparisonInterface interface {
+	BaseRepository() *RepositoryResolver
+	FileDiffs(ctx context.Context, args *FileDiffsConnectionArgs) (FileDiffConnection, error)
+
+	ToRepositoryComparison() (*RepositoryComparisonResolver, bool)
+	ToPreviewRepositoryComparison() (PreviewRepositoryComparisonResolver, bool)
 }
 
 type FileDiffConnection interface {
@@ -51,7 +60,7 @@ type FileDiff interface {
 	InternalID() string
 }
 
-func NewRepositoryComparison(ctx context.Context, r *RepositoryResolver, args *RepositoryComparisonInput) (*RepositoryComparisonResolver, error) {
+func NewRepositoryComparison(ctx context.Context, db dbutil.DB, r *RepositoryResolver, args *RepositoryComparisonInput) (*RepositoryComparisonResolver, error) {
 	var baseRevspec, headRevspec string
 	if args.Base == nil {
 		baseRevspec = "HEAD"
@@ -64,7 +73,7 @@ func NewRepositoryComparison(ctx context.Context, r *RepositoryResolver, args *R
 		headRevspec = *args.Head
 	}
 
-	getCommit := func(ctx context.Context, repo gitserver.Repo, revspec string) (*GitCommitResolver, error) {
+	getCommit := func(ctx context.Context, repo api.RepoName, revspec string) (*GitCommitResolver, error) {
 		if revspec == git.DevNullSHA {
 			return nil, nil
 		}
@@ -72,65 +81,39 @@ func NewRepositoryComparison(ctx context.Context, r *RepositoryResolver, args *R
 		opt := git.ResolveRevisionOptions{
 			NoEnsureRevision: !args.FetchMissing,
 		}
-		// Optimistically fetch using revspec
-		commit, err := git.GetCommit(ctx, repo, nil, api.CommitID(revspec), opt)
-		if err == nil {
-			return toGitCommitResolver(r, commit), nil
-		}
 
 		// Call ResolveRevision to trigger fetches from remote (in case base/head commits don't
 		// exist).
-		commitID, err := git.ResolveRevision(ctx, repo, nil, revspec, opt)
+		commitID, err := git.ResolveRevision(ctx, repo, revspec, opt)
 		if err != nil {
 			return nil, err
 		}
 
-		commit, err = git.GetCommit(ctx, repo, nil, commitID, opt)
-		if err != nil {
-			return nil, err
-		}
-		return toGitCommitResolver(r, commit), nil
+		return toGitCommitResolver(r, db, commitID, nil), nil
 	}
 
-	grepo, err := backend.CachedGitRepo(ctx, r.repo)
+	head, err := getCommit(ctx, r.RepoName(), headRevspec)
 	if err != nil {
 		return nil, err
 	}
 
-	var (
-		wg               sync.WaitGroup
-		base, head       *GitCommitResolver
-		baseErr, headErr error
-	)
-
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		// Find the common merge-base for the diff. That's the revision the diff applies to,
-		// not the baseRevspec.
-		mergeBaseCommit, err := git.MergeBase(ctx, *grepo, api.CommitID(baseRevspec), api.CommitID(headRevspec))
-		if err != nil {
-			baseErr = err
-			return
-		}
-		// We use the merge-base as the base commit here, as the diff will only be guaranteed to be
-		// applicable to the file from that revision.
-		commitString := strings.TrimSpace(string(mergeBaseCommit))
-		base, baseErr = getCommit(ctx, *grepo, commitString)
-	}()
-	go func() {
-		defer wg.Done()
-		head, headErr = getCommit(ctx, *grepo, headRevspec)
-	}()
-	wg.Wait()
-	if baseErr != nil {
-		return nil, baseErr
+	// Find the common merge-base for the diff. That's the revision the diff applies to,
+	// not the baseRevspec.
+	mergeBaseCommit, err := git.MergeBase(ctx, r.RepoName(), api.CommitID(baseRevspec), api.CommitID(headRevspec))
+	if err != nil {
+		return nil, err
 	}
-	if headErr != nil {
-		return nil, headErr
+
+	// We use the merge-base as the base commit here, as the diff will only be guaranteed to be
+	// applicable to the file from that revision.
+	commitString := strings.TrimSpace(string(mergeBaseCommit))
+	base, err := getCommit(ctx, r.RepoName(), commitString)
+	if err != nil {
+		return nil, err
 	}
 
 	return &RepositoryComparisonResolver{
+		db:          db,
 		baseRevspec: baseRevspec,
 		headRevspec: headRevspec,
 		base:        base,
@@ -140,13 +123,25 @@ func NewRepositoryComparison(ctx context.Context, r *RepositoryResolver, args *R
 }
 
 func (r *RepositoryResolver) Comparison(ctx context.Context, args *RepositoryComparisonInput) (*RepositoryComparisonResolver, error) {
-	return NewRepositoryComparison(ctx, r, args)
+	return NewRepositoryComparison(ctx, r.db, r, args)
 }
 
 type RepositoryComparisonResolver struct {
+	db                       dbutil.DB
 	baseRevspec, headRevspec string
 	base, head               *GitCommitResolver
 	repo                     *RepositoryResolver
+}
+
+// Type guard.
+var _ RepositoryComparisonInterface = &RepositoryComparisonResolver{}
+
+func (r *RepositoryComparisonResolver) ToPreviewRepositoryComparison() (PreviewRepositoryComparisonResolver, bool) {
+	return nil, false
+}
+
+func (r *RepositoryComparisonResolver) ToRepositoryComparison() (*RepositoryComparisonResolver, bool) {
+	return r, true
 }
 
 func (r *RepositoryComparisonResolver) BaseRepository() *RepositoryResolver { return r.repo }
@@ -166,28 +161,29 @@ func (r *RepositoryComparisonResolver) Commits(
 	args *graphqlutil.ConnectionArgs,
 ) *gitCommitConnectionResolver {
 	return &gitCommitConnectionResolver{
-		revisionRange: string(r.baseRevspec) + ".." + string(r.headRevspec),
+		db:            r.db,
+		revisionRange: r.baseRevspec + ".." + r.headRevspec,
 		first:         args.First,
 		repo:          r.repo,
 	}
 }
 
-func (r *RepositoryComparisonResolver) FileDiffs(
-	args *FileDiffsConnectionArgs,
-) FileDiffConnection {
+func (r *RepositoryComparisonResolver) FileDiffs(ctx context.Context, args *FileDiffsConnectionArgs) (FileDiffConnection, error) {
 	return NewFileDiffConnectionResolver(
+		r.db,
 		r.base,
 		r.head,
 		args,
 		computeRepositoryComparisonDiff(r),
 		repositoryComparisonNewFile,
-	)
+	), nil
 }
 
 // repositoryComparisonNewFile is the default NewFileFunc used by
 // RepositoryComparisonResolver to produce the new file in a FileDiffResolver.
-func repositoryComparisonNewFile(r *FileDiffResolver) FileResolver {
+func repositoryComparisonNewFile(db dbutil.DB, r *FileDiffResolver) FileResolver {
 	return &GitTreeEntryResolver{
+		db:     db,
 		commit: r.Head,
 		stat:   CreateFileInfo(r.FileDiff.NewName, false),
 	}
@@ -225,15 +221,9 @@ func computeRepositoryComparisonDiff(cmp *RepositoryComparisonResolver) ComputeD
 				base = string(cmp.base.OID())
 			}
 
-			var cachedRepo *gitserver.Repo
-			cachedRepo, err = backend.CachedGitRepo(ctx, cmp.repo.repo)
-			if err != nil {
-				return
-			}
-
 			var iter *git.DiffFileIterator
 			iter, err = git.Diff(ctx, git.DiffOptions{
-				Repo: *cachedRepo,
+				Repo: cmp.repo.RepoName(),
 				Base: base,
 				Head: string(cmp.head.OID()),
 			})
@@ -282,15 +272,17 @@ type ComputeDiffFunc func(ctx context.Context, args *FileDiffsConnectionArgs) ([
 
 // NewFileFunc is a function that returns the "new" file in a FileDiff as a
 // FileResolver.
-type NewFileFunc func(r *FileDiffResolver) FileResolver
+type NewFileFunc func(db dbutil.DB, r *FileDiffResolver) FileResolver
 
 func NewFileDiffConnectionResolver(
+	db dbutil.DB,
 	base, head *GitCommitResolver,
 	args *FileDiffsConnectionArgs,
 	compute ComputeDiffFunc,
 	newFileFunc NewFileFunc,
 ) *fileDiffConnectionResolver {
 	return &fileDiffConnectionResolver{
+		db:      db,
 		base:    base,
 		head:    head,
 		first:   args.First,
@@ -301,6 +293,7 @@ func NewFileDiffConnectionResolver(
 }
 
 type fileDiffConnectionResolver struct {
+	db      dbutil.DB
 	base    *GitCommitResolver
 	head    *GitCommitResolver
 	first   *int32
@@ -325,6 +318,7 @@ func (r *fileDiffConnectionResolver) Nodes(ctx context.Context) ([]FileDiff, err
 	resolvers := make([]FileDiff, len(fileDiffs))
 	for i, fileDiff := range fileDiffs {
 		resolvers[i] = &FileDiffResolver{
+			db:       r.db,
 			newFile:  r.newFile,
 			FileDiff: fileDiff,
 			Base:     r.base,
@@ -389,6 +383,7 @@ type FileDiffResolver struct {
 	Base     *GitCommitResolver
 	Head     *GitCommitResolver
 
+	db      dbutil.DB
 	newFile NewFileFunc
 }
 
@@ -417,6 +412,7 @@ func (r *FileDiffResolver) OldFile() FileResolver {
 		return nil
 	}
 	return &GitTreeEntryResolver{
+		db:     r.db,
 		commit: r.Base,
 		stat:   CreateFileInfo(r.FileDiff.OrigName, false),
 	}
@@ -426,7 +422,7 @@ func (r *FileDiffResolver) NewFile() FileResolver {
 	if diffPathOrNull(r.FileDiff.NewName) == nil {
 		return nil
 	}
-	return r.newFile(r)
+	return r.newFile(r.db, r)
 }
 
 func (r *FileDiffResolver) MostRelevantFile() FileResolver {
@@ -528,11 +524,51 @@ func (r *DiffHunk) Highlight(ctx context.Context, args *HighlightArgs) (*highlig
 	if err != nil {
 		return nil, err
 	}
+
 	hunkLines := strings.Split(string(r.hunk.Body), "\n")
+
 	// Remove final empty line on files that end with a newline, as most code hosts do.
 	if hunkLines[len(hunkLines)-1] == "" {
 		hunkLines = hunkLines[:len(hunkLines)-1]
 	}
+
+	// Trim a trailing empty line to match the behavior of highlight.Code
+	// If this isn't done, it causes the length of highlightedHead to be
+	// different than the length of hunkLines, which leads to out-of-bounds
+	// errors like https://github.com/sourcegraph/sourcegraph/issues/20405
+	if hunkLines[len(hunkLines)-1] == "+" {
+		hunkLines = hunkLines[:len(hunkLines)-1]
+	}
+
+	// Now do the same thing for trailing "-" lines. But only if they're not
+	// followed by an "unchanged" line.
+	var lastMinus = -1
+	for i, hunkLine := range hunkLines {
+		if hunkLine == " " {
+			lastMinus = -1
+		} else if hunkLine == "-" {
+			lastMinus = i
+		}
+	}
+	// Empty "-" line that's not followed by an unchanged line, so cut it out
+	if lastMinus > -1 {
+		hunkLines = append(hunkLines[:lastMinus], hunkLines[lastMinus+1:]...)
+	}
+
+	// Even after all the logic above, we were still hitting out-of-bounds panics:
+	// https://github.com/sourcegraph/sourcegraph/issues/21054
+	// Ultimately, we'll need a cleaner solution than this, but for now, just
+	// returning an empty line div when one was trimmed unexpectedly will at least
+	// protect from panics.
+	// Tracking issue: https://github.com/sourcegraph/sourcegraph/issues/20704
+	safeIndex := func(lines []template.HTML, target int32) string {
+		if len(lines) > int(target) {
+			return string(lines[target])
+		}
+		log15.Warn("returned default value for out of bounds index on highlighted code")
+		return `<div>\n</div>`
+	}
+
 	highlightedDiffHunkLineResolvers := make([]*highlightedDiffHunkLineResolver, len(hunkLines))
 	// Lines in highlightedBase and highlightedHead are 0-indexed.
 	baseLine := r.hunk.OrigStartLine - 1
@@ -541,19 +577,19 @@ func (r *DiffHunk) Highlight(ctx context.Context, args *HighlightArgs) (*highlig
 		highlightedDiffHunkLineResolver := highlightedDiffHunkLineResolver{}
 		if hunkLine[0] == ' ' {
 			highlightedDiffHunkLineResolver.kind = "UNCHANGED"
-			highlightedDiffHunkLineResolver.html = string(highlightedBase[baseLine])
+			highlightedDiffHunkLineResolver.html = safeIndex(highlightedBase, baseLine)
 			baseLine++
 			headLine++
 		} else if hunkLine[0] == '+' {
 			highlightedDiffHunkLineResolver.kind = "ADDED"
-			highlightedDiffHunkLineResolver.html = string(highlightedHead[headLine])
+			highlightedDiffHunkLineResolver.html = safeIndex(highlightedHead, headLine)
 			headLine++
 		} else if hunkLine[0] == '-' {
 			highlightedDiffHunkLineResolver.kind = "DELETED"
-			highlightedDiffHunkLineResolver.html = string(highlightedBase[baseLine])
+			highlightedDiffHunkLineResolver.html = safeIndex(highlightedBase, baseLine)
 			baseLine++
 		} else {
-			return nil, fmt.Errorf("expected patch lines to start with ' ', '-', '+', but found %q", hunkLine[0])
+			return nil, errors.Errorf("expected patch lines to start with ' ', '-', '+', but found %q", hunkLine[0])
 		}
 
 		highlightedDiffHunkLineResolvers[i] = &highlightedDiffHunkLineResolver

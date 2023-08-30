@@ -4,15 +4,17 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
-	"fmt"
 	"net/url"
 
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
+	"github.com/inconshreveable/log15"
+
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/envvar"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/globals"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/app/router"
 	"github.com/sourcegraph/sourcegraph/internal/conf"
-	"github.com/sourcegraph/sourcegraph/internal/db"
+	"github.com/sourcegraph/sourcegraph/internal/database"
+	"github.com/sourcegraph/sourcegraph/internal/database/dbutil"
 	"github.com/sourcegraph/sourcegraph/internal/errcode"
 	"github.com/sourcegraph/sourcegraph/internal/txemail"
 	"github.com/sourcegraph/sourcegraph/internal/txemail/txtypes"
@@ -27,7 +29,7 @@ type userEmails struct{}
 // of other people whom they want to annoy.
 func checkEmailAbuse(ctx context.Context, userID int32) (abused bool, reason string, err error) {
 	if conf.EmailVerificationRequired() {
-		emails, err := db.UserEmails.ListByUser(ctx, db.UserEmailsListOptions{
+		emails, err := database.GlobalUserEmails.ListByUser(ctx, database.UserEmailsListOptions{
 			UserID: userID,
 		})
 		if err != nil {
@@ -71,7 +73,7 @@ func checkEmailAbuse(ctx context.Context, userID int32) (abused bool, reason str
 		// TODO(sqs): This reuses the "invite quota", which is really just a number that counts
 		// down (not specific to invites). Generalize this to just "quota" (remove "invite" from
 		// the name).
-		if ok, err := db.Users.CheckAndDecrementInviteQuota(ctx, userID); err != nil {
+		if ok, err := database.GlobalUsers.CheckAndDecrementInviteQuota(ctx, userID); err != nil {
 			return false, "", err
 		} else if !ok {
 			return true, "email address quota exceeded (contact support to increase the quota)", nil
@@ -82,20 +84,20 @@ func checkEmailAbuse(ctx context.Context, userID int32) (abused bool, reason str
 
 // Add adds an email address to a user. If email verification is required, it sends an email
 // verification email.
-func (userEmails) Add(ctx context.Context, userID int32, email string) error {
+func (userEmails) Add(ctx context.Context, db dbutil.DB, userID int32, email string) error {
 	// 🚨 SECURITY: Only the user and site admins can add an email address to a user.
-	if err := CheckSiteAdminOrSameUser(ctx, userID); err != nil {
+	if err := CheckSiteAdminOrSameUser(ctx, db, userID); err != nil {
 		return err
 	}
 
 	// Prevent abuse (users adding emails of other people whom they want to annoy) with the
 	// following abuse prevention checks.
-	if isSiteAdmin := CheckCurrentUserIsSiteAdmin(ctx) == nil; !isSiteAdmin {
+	if isSiteAdmin := CheckCurrentUserIsSiteAdmin(ctx, db) == nil; !isSiteAdmin {
 		abused, reason, err := checkEmailAbuse(ctx, userID)
 		if err != nil {
 			return err
 		} else if abused {
-			return fmt.Errorf("refusing to add email address because %s", reason)
+			return errors.Errorf("refusing to add email address because %s", reason)
 		}
 	}
 
@@ -113,25 +115,29 @@ func (userEmails) Add(ctx context.Context, userID int32, email string) error {
 	// user that another user has already verified it, to avoid needlessly leaking the existence
 	// of emails.
 	var emailAlreadyExistsAndIsVerified bool
-	if _, err := db.Users.GetByVerifiedEmail(ctx, email); err != nil && !errcode.IsNotFound(err) {
+	if _, err := database.GlobalUsers.GetByVerifiedEmail(ctx, email); err != nil && !errcode.IsNotFound(err) {
 		return err
 	} else if err == nil {
 		emailAlreadyExistsAndIsVerified = true
 	}
 
-	if err := db.UserEmails.Add(ctx, userID, email, code); err != nil {
+	if err := database.GlobalUserEmails.Add(ctx, userID, email, code); err != nil {
 		return err
 	}
 
 	if conf.EmailVerificationRequired() && !emailAlreadyExistsAndIsVerified {
+		usr, err := database.GlobalUsers.GetByID(ctx, userID)
+		if err != nil {
+			return err
+		}
+
 		// Send email verification email.
-		if err := SendUserEmailVerificationEmail(ctx, email, *code); err != nil {
+		if err := SendUserEmailVerificationEmail(ctx, usr.Username, email, *code); err != nil {
 			return errors.Wrap(err, "SendUserEmailVerificationEmail")
-		} else if err = db.UserEmails.SetLastVerificationSentAt(ctx, userID, email); err != nil {
+		} else if err = database.GlobalUserEmails.SetLastVerification(ctx, userID, email, *code); err != nil {
 			return errors.Wrap(err, "SetLastVerificationSentAt")
 		}
 	}
-
 	return nil
 }
 
@@ -147,7 +153,7 @@ func MakeEmailVerificationCode() (string, error) {
 
 // SendUserEmailVerificationEmail sends an email to the user to verify the email address. The code
 // is the verification code that the user must provide to verify their access to the email address.
-func SendUserEmailVerificationEmail(ctx context.Context, email, code string) error {
+func SendUserEmailVerificationEmail(ctx context.Context, username, email, code string) error {
 	q := make(url.Values)
 	q.Set("code", code)
 	q.Set("email", email)
@@ -156,28 +162,79 @@ func SendUserEmailVerificationEmail(ctx context.Context, email, code string) err
 		To:       []string{email},
 		Template: verifyEmailTemplates,
 		Data: struct {
-			Email string
-			URL   string
+			Username string
+			URL      string
+			Host     string
 		}{
-			Email: email,
+			Username: username,
 			URL: globals.ExternalURL().ResolveReference(&url.URL{
 				Path:     verifyEmailPath.Path,
 				RawQuery: q.Encode(),
 			}).String(),
+			Host: globals.ExternalURL().Host,
 		},
 	})
 }
 
 var verifyEmailTemplates = txemail.MustValidate(txtypes.Templates{
-	Subject: `Verify your email on Sourcegraph`,
-	Text: `
-Verify your email address {{printf "%q" .Email}} on Sourcegraph by following this link:
+	Subject: `Verify your email on Sourcegraph ({{.Host}})`,
+	Text: `Hi {{.Username}},
 
-  {{.URL}}
+Please verify your email address on Sourcegraph ({{.Host}}) by clicking this link:
+
+{{.URL}}
 `,
-	HTML: `
-<p>Verify your email address {{printf "%q" .Email}} on Sourcegraph by following this link:</p>
+	HTML: `<p>Hi {{.Username}},</p>
+
+<p>Please verify your email address on Sourcegraph ({{.Host}}) by clicking this link:</p>
 
 <p><strong><a href="{{.URL}}">Verify email address</a></p>
+`,
+})
+
+// SendUserEmailOnFieldUpdate sends the user an email that important account information has changed.
+// The change is the information we want to provide the user about the change
+func (userEmails) SendUserEmailOnFieldUpdate(ctx context.Context, id int32, change string) error {
+	email, _, err := database.GlobalUserEmails.GetPrimaryEmail(ctx, id)
+	if err != nil {
+		log15.Warn("Failed to get user email", "error", err)
+		return err
+	}
+	usr, err := database.GlobalUsers.GetByID(ctx, id)
+	if err != nil {
+		log15.Warn("Failed to get user from database", "error", err)
+		return err
+	}
+
+	return txemail.Send(ctx, txemail.Message{
+		To:       []string{email},
+		Template: updateAccountEmailTemplate,
+		Data: struct {
+			Email    string
+			Change   string
+			Username string
+			Host     string
+		}{
+			Email:    email,
+			Change:   change,
+			Username: usr.Username,
+			Host:     globals.ExternalURL().Host,
+		},
+	})
+}
+
+var updateAccountEmailTemplate = txemail.MustValidate(txtypes.Templates{
+	Subject: `Update to your Sourcegraph account ({{.Host}})`,
+	Text: `
+Somebody (likely you) {{.Change}} for the user {{.Username}} on Sourcegraph ({{.Host}}).
+
+If this was not you please change your password immediately.
+`,
+	HTML: `
+<p>
+Somebody (likely you) <strong>{{.Change}}</strong> for the user <strong>{{.Username}}</strong> on Sourcegraph ({{.Host}}).
+</p>
+
+<p><strong>If this was not you please change your password immediately.</strong></p>
 `,
 })

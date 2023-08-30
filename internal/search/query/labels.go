@@ -3,7 +3,7 @@ package query
 import "sort"
 
 // Labels are general-purpose annotations that store information about a node.
-type labels uint8
+type labels uint16
 
 const (
 	None    labels = 0
@@ -13,6 +13,8 @@ const (
 	HeuristicParensAsPatterns
 	HeuristicDanglingParens
 	HeuristicHoisted
+	Structural
+	IsPredicate
 )
 
 var allLabels = map[labels]string{
@@ -23,9 +25,11 @@ var allLabels = map[labels]string{
 	HeuristicParensAsPatterns: "HeuristicParensAsPatterns",
 	HeuristicDanglingParens:   "HeuristicDanglingParens",
 	HeuristicHoisted:          "HeuristicHoisted",
+	Structural:                "Structural",
+	IsPredicate:               "IsPredicate",
 }
 
-func (l *labels) isSet(label labels) bool {
+func (l *labels) IsSet(label labels) bool {
 	return *l&label != 0
 }
 
@@ -43,7 +47,7 @@ func (l *labels) String() []string {
 	}
 	var s []string
 	for k, v := range allLabels {
-		if l.isSet(k) {
+		if l.IsSet(k) {
 			s = append(s, v)
 		}
 	}

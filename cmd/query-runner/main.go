@@ -15,14 +15,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/inconshreveable/log15"
-	"github.com/pkg/errors"
 
 	"github.com/sourcegraph/sourcegraph/cmd/query-runner/queryrunnerapi"
 	"github.com/sourcegraph/sourcegraph/internal/api"
 	"github.com/sourcegraph/sourcegraph/internal/debugserver"
 	"github.com/sourcegraph/sourcegraph/internal/env"
 	"github.com/sourcegraph/sourcegraph/internal/eventlogger"
+	"github.com/sourcegraph/sourcegraph/internal/logging"
+	"github.com/sourcegraph/sourcegraph/internal/trace"
 	"github.com/sourcegraph/sourcegraph/internal/tracer"
 )
 
@@ -33,8 +35,9 @@ const port = "3183"
 func main() {
 	env.Lock()
 	env.HandleHelpFlag()
-
+	logging.Init()
 	tracer.Init()
+	trace.Init(true)
 
 	go func() {
 		c := make(chan os.Signal, 1)
@@ -43,7 +46,10 @@ func main() {
 		os.Exit(0)
 	}()
 
-	go debugserver.Start()
+	// Ready immediately
+	ready := make(chan struct{})
+	close(ready)
+	go debugserver.NewServerRoutine(ready).Start()
 
 	ctx := context.Background()
 
@@ -66,7 +72,13 @@ func main() {
 	}
 	addr := net.JoinHostPort(host, port)
 	log15.Info("query-runner: listening", "addr", addr)
-	log.Fatalf("Fatal error serving: %s", http.ListenAndServe(addr, nil))
+	s := http.Server{
+		ReadTimeout:  75 * time.Second,
+		WriteTimeout: 10 * time.Minute,
+		Addr:         addr,
+		Handler:      http.DefaultServeMux,
+	}
+	log.Fatalf("Fatal error serving: %s", s.ListenAndServe())
 }
 
 func writeError(w http.ResponseWriter, err error) {
@@ -243,7 +255,7 @@ func performSearch(ctx context.Context, query string) (v *gqlSearchResponse, exe
 		}
 
 		if attempts > 5 {
-			return nil, execDuration, fmt.Errorf("found 0 results due to %d cloning %d timedout repos", cloning, timedout)
+			return nil, execDuration, errors.Errorf("found 0 results due to %d cloning %d timedout repos", cloning, timedout)
 		}
 
 		// We didn't find any search results. Some repos are cloning or timed
@@ -317,6 +329,14 @@ const (
 )
 
 func searchURL(query, utmSource string) string {
+	return sourcegraphURL("search", query, utmSource)
+}
+
+func savedSearchListPageURL(utmSource string) string {
+	return sourcegraphURL("user/searches", "", utmSource)
+}
+
+func sourcegraphURL(path, query, utmSource string) string {
 	if externalURL == nil {
 		// Determine the external URL.
 		externalURLStr, err := api.InternalClient.ExternalURL(context.Background())
@@ -332,9 +352,11 @@ func searchURL(query, utmSource string) string {
 	}
 
 	// Construct URL to the search query.
-	u := externalURL.ResolveReference(&url.URL{Path: "search"})
+	u := externalURL.ResolveReference(&url.URL{Path: path})
 	q := u.Query()
-	q.Set("q", query)
+	if query != "" {
+		q.Set("q", query)
+	}
 	q.Set("utm_source", utmSource)
 	u.RawQuery = q.Encode()
 	return u.String()

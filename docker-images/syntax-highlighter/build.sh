@@ -6,5 +6,5 @@ set -ex
 # actual image currently lives here: https://github.com/sourcegraph/infrastructure/tree/master/docker-images
 #
 # TODO: Move the image to this directory so it is open-source and built in CI automatically.
-docker pull index.docker.io/sourcegraph/syntect_server:ff37f90@sha256:aa93514b7bc3aaf7a4e9c92e5ff52ee5052db6fb101255a69f054e5b8cdb46ff
-docker tag index.docker.io/sourcegraph/syntect_server:ff37f90@sha256:aa93514b7bc3aaf7a4e9c92e5ff52ee5052db6fb101255a69f054e5b8cdb46ff "$IMAGE"
+docker pull docker.io/sourcegraph/syntect_server:71d2481@sha256:8854665264522a86b711c732d803395478dab30f6df6197b5d0c1c7c21cd6261
+docker tag docker.io/sourcegraph/syntect_server:71d2481@sha256:8854665264522a86b711c732d803395478dab30f6df6197b5d0c1c7c21cd6261 "$IMAGE"

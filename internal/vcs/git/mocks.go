@@ -2,10 +2,9 @@ package git
 
 import (
 	"io"
-	"os"
+	"io/fs"
 
 	"github.com/sourcegraph/sourcegraph/internal/api"
-	"github.com/sourcegraph/sourcegraph/internal/gitserver"
 )
 
 // Mocks is used to mock behavior in tests. Tests must call ResetMocks() when finished to ensure its
@@ -19,12 +18,13 @@ var Mocks, emptyMocks struct {
 	RawLogDiffSearch func(opt RawLogDiffSearchOptions) ([]*LogCommitSearchResult, bool, error)
 	NewFileReader    func(commit api.CommitID, name string) (io.ReadCloser, error)
 	ReadFile         func(commit api.CommitID, name string) ([]byte, error)
-	ReadDir          func(commit api.CommitID, name string, recurse bool) ([]os.FileInfo, error)
+	ReadDir          func(commit api.CommitID, name string, recurse bool) ([]fs.FileInfo, error)
+	LsFiles          func(repo api.RepoName, commit api.CommitID) ([]string, error)
 	ResolveRevision  func(spec string, opt ResolveRevisionOptions) (api.CommitID, error)
-	Stat             func(commit api.CommitID, name string) (os.FileInfo, error)
+	Stat             func(commit api.CommitID, name string) (fs.FileInfo, error)
 	GetObject        func(objectName string) (OID, ObjectType, error)
-	Commits          func(repo gitserver.Repo, opt CommitsOptions) ([]*Commit, error)
-	MergeBase        func(repo gitserver.Repo, a, b api.CommitID) (api.CommitID, error)
+	Commits          func(repo api.RepoName, opt CommitsOptions) ([]*Commit, error)
+	MergeBase        func(repo api.RepoName, a, b api.CommitID) (api.CommitID, error)
 }
 
 // ResetMocks clears the mock functions set on Mocks (so that subsequent tests don't inadvertently

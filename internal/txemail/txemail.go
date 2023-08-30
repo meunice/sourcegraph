@@ -4,14 +4,15 @@ package txemail
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"net"
 	"net/smtp"
 	"net/textproto"
 	"strconv"
 
+	"github.com/cockroachdb/errors"
 	"github.com/jordan-wright/email"
+
 	"github.com/sourcegraph/sourcegraph/internal/conf"
 	"github.com/sourcegraph/sourcegraph/internal/txemail/txtypes"
 )
@@ -114,10 +115,11 @@ func Send(ctx context.Context, message Message) error {
 	case "CRAM-MD5":
 		smtpAuth = smtp.CRAMMD5Auth(conf.EmailSmtp.Username, conf.EmailSmtp.Password)
 	default:
-		return fmt.Errorf("invalid SMTP authentication type %q", conf.EmailSmtp.Authentication)
+		return errors.Errorf("invalid SMTP authentication type %q", conf.EmailSmtp.Authentication)
 	}
 
-	if conf.EmailSmtp.DisableTLS {
+	// TODO: 2020/11/12 @arussellsaw, after next release delete DisableTLS option
+	if conf.EmailSmtp.DisableTLS || conf.EmailSmtp.NoVerifyTLS {
 		return m.SendWithStartTLS(
 			net.JoinHostPort(conf.EmailSmtp.Host, strconv.Itoa(conf.EmailSmtp.Port)),
 			smtpAuth,

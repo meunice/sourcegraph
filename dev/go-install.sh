@@ -6,7 +6,7 @@
 # This will install binaries into the `.bin` directory under the repository root.
 #
 
-all_oss_commands=" gitserver query-runner github-proxy searcher replacer frontend repo-updater symbols "
+all_oss_commands=" gitserver query-runner github-proxy searcher frontend repo-updater worker symbols "
 all_commands="${all_oss_commands}${ENTERPRISE_ONLY_COMMANDS}"
 
 # handle options
@@ -49,20 +49,6 @@ mkdir -p .bin
 export GOBIN="${PWD}/.bin"
 export GO111MODULE=on
 
-INSTALL_GO_TOOLS=(
-  "github.com/mattn/goreman@v0.3.4"
-)
-
-# Need to go to a temp directory for tools or we update our go.mod. We use
-# GOPROXY=direct to avoid always consulting a proxy for dlv.
-pushd "${TMPDIR:-/tmp}" >/dev/null || exit 1
-if ! GOPROXY=direct go get -v "${INSTALL_GO_TOOLS[@]}" 2>go-install.log; then
-  cat go-install.log
-  echo >&2 "failed to install prerequisite tools, aborting."
-  exit 1
-fi
-popd >/dev/null || exit 1
-
 INSTALL_GO_PKGS=(
   "github.com/google/zoekt/cmd/zoekt-archive-index"
   "github.com/google/zoekt/cmd/zoekt-git-index"
@@ -79,13 +65,10 @@ fi
 # we can update only those packages that change. Clean up the temp at exit.
 tmpdir="$(mktemp -d -t src-binaries.XXXXXXXX)"
 trap 'rm -rf "$tmpdir"' EXIT
-export GOBIN="$tmpdir"
 
-TAGS='dev'
 if [ -n "$DELVE" ]; then
-  echo >&2 'Building with optimizations disabled (for debugging). Make sure you have at least go1.10 installed.'
+  echo -e "Building Go code with optimizations disabled (for debugging)." >&2
   GCFLAGS='all=-N -l'
-  TAGS="$TAGS delve"
 fi
 
 # build a list of "cmd,true" and "cmd,false" pairs to indicate whether each command
@@ -113,13 +96,24 @@ case $GORACED in
     ;;
 esac
 
+# Cross-platform md5sum. Fallback to BSD md5 if md5sum doesn't exist.
+do_md5() {
+  pushd "${GOBIN}" >/dev/null || exit 1
+  if command -v md5sum >/dev/null 2>&1; then
+    md5sum "$@" 2>/dev/null
+  else
+    md5 -r "$@" 2>/dev/null
+  fi
+  popd >/dev/null || exit 1
+}
+
 # Shared logic for the go install part
 do_install() {
   race=$1
   shift
-  cmdlist="$*"
+  cmdlist=("$@")
   cmds=()
-  for cmd in $cmdlist; do
+  for cmd in "${cmdlist[@]}"; do
     replaced=false
     for enterpriseCmd in $ENTERPRISE_COMMANDS; do
       if [ "$cmd" == "$enterpriseCmd" ]; then
@@ -131,20 +125,22 @@ do_install() {
       cmds+=("github.com/sourcegraph/sourcegraph/cmd/$cmd")
     fi
   done
-  if (go install -v -gcflags="$GCFLAGS" -tags "$TAGS" -race="$race" "${cmds[@]}"); then
-    for cmd in $cmdlist; do
-      # Check whether the binary of each command has changed
-      if ! cmp -s "${GOBIN}/${cmd}" "${PWD}/.bin/${cmd}"; then
-        # Binary updated. Move it to correct location.
-        mv "${GOBIN}/${cmd}" "${PWD}/.bin/${cmd}"
 
-        if $verbose; then
-          echo "$cmd"
-        fi
-      fi
-    done
+  # Store hashes of binaries so we know what changes. We let go install
+  # directly write to the binaries since go will skip compiling a binary if it
+  # believes it hasn't changed.
+  do_md5 "${cmdlist[@]}" >"${tmpdir}/digest.txt"
+
+  if (go install -v -gcflags="$GCFLAGS" -race="$race" "${cmds[@]}"); then
+    if $verbose; then
+      # Add the digests after compilation
+      do_md5 "${cmdlist[@]}" >>"${tmpdir}/digest.txt"
+      # Now any digest that is unique ($1 == 1) will mean the binary for it
+      # changed or came into existance.
+      sort "${tmpdir}/digest.txt" | uniq -c | awk '$1 == 1 { print $3 }' | sort | uniq
+    fi
   else
-    failed="$failed $cmdlist"
+    failed="$failed ${cmdlist[*]}"
   fi
 }
 

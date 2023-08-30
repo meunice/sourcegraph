@@ -3,6 +3,7 @@ package git
 import (
 	"bytes"
 	"context"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -29,8 +30,16 @@ func TestRepository_FileSystem_Symlinks(t *testing.T) {
 
 	symlinks := []string{"link1", "dir1/link2"}
 
-	repo := MakeGitRepository(t, gitCommands...)
-	commitID := api.CommitID(ComputeCommitHash(repo.URL, true))
+	dir := InitGitRepository(t, gitCommands...)
+	repo := api.RepoName(filepath.Base(dir))
+
+	if resp, err := gitserver.DefaultClient.RequestRepoUpdate(context.Background(), repo, 0); err != nil {
+		t.Fatal(err)
+	} else if resp.Error != "" {
+		t.Fatal(resp.Error)
+	}
+
+	commitID := api.CommitID(ComputeCommitHash(dir, true))
 
 	ctx := context.Background()
 
@@ -43,7 +52,7 @@ func TestRepository_FileSystem_Symlinks(t *testing.T) {
 		t.Errorf("file1 Stat !IsRegular (mode: %o)", file1Info.Mode())
 	}
 
-	checkSymlinkFileInfo := func(name string, link os.FileInfo) {
+	checkSymlinkFileInfo := func(name string, link fs.FileInfo) {
 		t.Helper()
 		if link.Mode()&os.ModeSymlink == 0 {
 			t.Errorf("link mode is not symlink (mode: %o)", link.Mode())
@@ -104,6 +113,7 @@ func TestRepository_FileSystem_Symlinks(t *testing.T) {
 
 func TestRepository_FileSystem(t *testing.T) {
 	t.Parallel()
+	ctx := context.Background()
 
 	// In all tests, repo should contain three commits. The first commit
 	// (whose ID is in the 'first' field) has a file at dir1/file1 with the
@@ -128,7 +138,7 @@ func TestRepository_FileSystem(t *testing.T) {
 		"GIT_COMMITTER_NAME=a GIT_COMMITTER_EMAIL=a@a.com GIT_COMMITTER_DATE=2018-05-06T19:20:21Z git commit -m commit3 --author='a <a@a.com>' --date 2018-05-06T19:20:21Z",
 	}
 	tests := map[string]struct {
-		repo                 gitserver.Repo
+		repo                 api.RepoName
 		first, second, third api.CommitID
 	}{
 		"git cmd": {
@@ -296,6 +306,7 @@ func TestRepository_FileSystem(t *testing.T) {
 
 func TestRepository_FileSystem_quoteChars(t *testing.T) {
 	t.Parallel()
+	ctx := context.Background()
 
 	// The repo contains 3 files: one whose filename includes a
 	// non-ASCII char, one whose filename contains a double quote, and
@@ -318,7 +329,7 @@ func TestRepository_FileSystem_quoteChars(t *testing.T) {
 		"GIT_COMMITTER_NAME=a GIT_COMMITTER_EMAIL=a@a.com GIT_COMMITTER_DATE=2006-01-02T15:04:05Z git commit -m commit1 --author='a <a@a.com>' --date 2006-01-02T15:04:05Z",
 	}
 	tests := map[string]struct {
-		repo gitserver.Repo
+		repo api.RepoName
 	}{
 		"git cmd (quotepath=on)": {
 			repo: MakeGitRepository(t, append([]string{"git config core.quotepath on"}, gitCommands...)...),
@@ -329,7 +340,7 @@ func TestRepository_FileSystem_quoteChars(t *testing.T) {
 	}
 
 	for label, test := range tests {
-		commitID, err := ResolveRevision(ctx, test.repo, nil, "master", ResolveRevisionOptions{})
+		commitID, err := ResolveRevision(ctx, test.repo, "master", ResolveRevisionOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -366,6 +377,7 @@ func TestRepository_FileSystem_quoteChars(t *testing.T) {
 
 func TestRepository_FileSystem_gitSubmodules(t *testing.T) {
 	t.Parallel()
+	ctx := context.Background()
 
 	submodDir := InitGitRepository(t,
 		"touch f",
@@ -379,7 +391,7 @@ func TestRepository_FileSystem_gitSubmodules(t *testing.T) {
 		"GIT_COMMITTER_NAME=a GIT_COMMITTER_EMAIL=a@a.com GIT_COMMITTER_DATE=2006-01-02T15:04:05Z git commit -m 'add submodule' --author='a <a@a.com>' --date 2006-01-02T15:04:05Z",
 	}
 	tests := map[string]struct {
-		repo gitserver.Repo
+		repo api.RepoName
 	}{
 		"git cmd": {
 			repo: MakeGitRepository(t, gitCommands...),
@@ -387,12 +399,12 @@ func TestRepository_FileSystem_gitSubmodules(t *testing.T) {
 	}
 
 	for label, test := range tests {
-		commitID, err := ResolveRevision(ctx, test.repo, nil, "master", ResolveRevisionOptions{})
+		commitID, err := ResolveRevision(ctx, test.repo, "master", ResolveRevisionOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		checkSubmoduleFileInfo := func(label string, submod os.FileInfo) {
+		checkSubmoduleFileInfo := func(label string, submod fs.FileInfo) {
 			if want := "submod"; submod.Name() != want {
 				t.Errorf("%s: submod.Name(): got %q, want %q", label, submod.Name(), want)
 			}
@@ -419,7 +431,7 @@ func TestRepository_FileSystem_gitSubmodules(t *testing.T) {
 			}
 		}
 
-		// Check the submodule os.FileInfo both when it's returned by
+		// Check the submodule fs.FileInfo both when it's returned by
 		// Stat and when it's returned in a list by ReadDir.
 		submod, err := Stat(ctx, test.repo, commitID, "submod")
 		if err != nil {

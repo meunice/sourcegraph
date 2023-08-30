@@ -4,18 +4,17 @@ import (
 	"context"
 	"testing"
 
-	"github.com/graph-gophers/graphql-go/gqltesting"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/types"
-	"github.com/sourcegraph/sourcegraph/internal/db"
+	"github.com/sourcegraph/sourcegraph/internal/database"
+	"github.com/sourcegraph/sourcegraph/internal/types"
 )
 
 func TestOrganization(t *testing.T) {
 	resetMocks()
-	db.Mocks.Orgs.GetByName = func(context.Context, string) (*types.Org, error) {
+	database.Mocks.Orgs.GetByName = func(context.Context, string) (*types.Org, error) {
 		return &types.Org{ID: 1, Name: "acme"}, nil
 	}
 
-	gqltesting.RunTests(t, []*gqltesting.Test{
+	RunTests(t, []*Test{
 		{
 			Schema: mustParseGraphQLSchema(t),
 			Query: `
@@ -38,9 +37,9 @@ func TestOrganization(t *testing.T) {
 
 func TestNode_Org(t *testing.T) {
 	resetMocks()
-	db.Mocks.Orgs.MockGetByID_Return(t, &types.Org{ID: 1, Name: "acme"}, nil)
+	database.Mocks.Orgs.MockGetByID_Return(t, &types.Org{ID: 1, Name: "acme"}, nil)
 
-	gqltesting.RunTests(t, []*gqltesting.Test{
+	RunTests(t, []*Test{
 		{
 			Schema: mustParseGraphQLSchema(t),
 			Query: `

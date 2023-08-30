@@ -2,13 +2,14 @@ package billing
 
 import (
 	"context"
-	"fmt"
 	"sort"
 	"strconv"
 
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/graphqlbackend"
+	"github.com/cockroachdb/errors"
 	"github.com/stripe/stripe-go"
 	"github.com/stripe/stripe-go/plan"
+
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/graphqlbackend"
 )
 
 // productPlan implements the GraphQL type ProductPlan.
@@ -53,13 +54,13 @@ func (r *planTier) FlatAmount() int32 { return int32(r.flatAmount) }
 func ToProductPlan(plan *stripe.Plan) (graphqlbackend.ProductPlan, error) {
 	// Sanity check.
 	if plan.Product.Name == "" {
-		return nil, fmt.Errorf("unexpected empty product name for plan %q", plan.ID)
+		return nil, errors.Errorf("unexpected empty product name for plan %q", plan.ID)
 	}
 	if plan.Currency != stripe.CurrencyUSD {
-		return nil, fmt.Errorf("unexpected currency %q for plan %q", plan.Currency, plan.ID)
+		return nil, errors.Errorf("unexpected currency %q for plan %q", plan.Currency, plan.ID)
 	}
 	if plan.IntervalCount != 1 {
-		return nil, fmt.Errorf("unexpected plan interval count %d for plan %q", plan.IntervalCount, plan.ID)
+		return nil, errors.Errorf("unexpected plan interval count %d for plan %q", plan.IntervalCount, plan.ID)
 	}
 
 	var tiers []graphqlbackend.PlanTier

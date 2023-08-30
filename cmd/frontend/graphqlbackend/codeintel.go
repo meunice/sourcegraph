@@ -2,82 +2,30 @@ package graphqlbackend
 
 import (
 	"context"
-	"errors"
 
 	"github.com/graph-gophers/graphql-go"
+
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/graphqlbackend/graphqlutil"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/types"
 	"github.com/sourcegraph/sourcegraph/internal/api"
+	"github.com/sourcegraph/sourcegraph/internal/types"
 )
 
 type CodeIntelResolver interface {
 	LSIFUploadByID(ctx context.Context, id graphql.ID) (LSIFUploadResolver, error)
 	LSIFUploads(ctx context.Context, args *LSIFUploadsQueryArgs) (LSIFUploadConnectionResolver, error)
 	LSIFUploadsByRepo(ctx context.Context, args *LSIFRepositoryUploadsQueryArgs) (LSIFUploadConnectionResolver, error)
-	DeleteLSIFUpload(ctx context.Context, id graphql.ID) (*EmptyResponse, error)
+	DeleteLSIFUpload(ctx context.Context, args *struct{ ID graphql.ID }) (*EmptyResponse, error)
 	LSIFIndexByID(ctx context.Context, id graphql.ID) (LSIFIndexResolver, error)
 	LSIFIndexes(ctx context.Context, args *LSIFIndexesQueryArgs) (LSIFIndexConnectionResolver, error)
 	LSIFIndexesByRepo(ctx context.Context, args *LSIFRepositoryIndexesQueryArgs) (LSIFIndexConnectionResolver, error)
-	DeleteLSIFIndex(ctx context.Context, id graphql.ID) (*EmptyResponse, error)
+	DeleteLSIFIndex(ctx context.Context, args *struct{ ID graphql.ID }) (*EmptyResponse, error)
+	IndexConfiguration(ctx context.Context, id graphql.ID) (IndexConfigurationResolver, error) // TODO - rename ...ForRepo
+	UpdateRepositoryIndexConfiguration(ctx context.Context, args *UpdateRepositoryIndexConfigurationArgs) (*EmptyResponse, error)
+	CommitGraph(ctx context.Context, id graphql.ID) (CodeIntelligenceCommitGraphResolver, error)
+	QueueAutoIndexJobForRepo(ctx context.Context, args *struct{ Repository graphql.ID }) (*EmptyResponse, error)
 	GitBlobLSIFData(ctx context.Context, args *GitBlobLSIFDataArgs) (GitBlobLSIFDataResolver, error)
-}
 
-var codeIntelOnlyInEnterprise = errors.New("lsif uploads and queries are only available in enterprise")
-
-type defaultCodeIntelResolver struct{}
-
-var DefaultCodeIntelResolver CodeIntelResolver = defaultCodeIntelResolver{}
-
-func (defaultCodeIntelResolver) LSIFUploadByID(ctx context.Context, id graphql.ID) (LSIFUploadResolver, error) {
-	return nil, codeIntelOnlyInEnterprise
-}
-
-func (defaultCodeIntelResolver) LSIFUploads(ctx context.Context, args *LSIFUploadsQueryArgs) (LSIFUploadConnectionResolver, error) {
-	return nil, codeIntelOnlyInEnterprise
-}
-
-func (defaultCodeIntelResolver) LSIFUploadsByRepo(ctx context.Context, args *LSIFRepositoryUploadsQueryArgs) (LSIFUploadConnectionResolver, error) {
-	return nil, codeIntelOnlyInEnterprise
-}
-
-func (defaultCodeIntelResolver) DeleteLSIFUpload(ctx context.Context, id graphql.ID) (*EmptyResponse, error) {
-	return nil, codeIntelOnlyInEnterprise
-}
-
-func (defaultCodeIntelResolver) LSIFIndexByID(ctx context.Context, id graphql.ID) (LSIFIndexResolver, error) {
-	return nil, codeIntelOnlyInEnterprise
-}
-
-func (defaultCodeIntelResolver) LSIFIndexes(ctx context.Context, args *LSIFIndexesQueryArgs) (LSIFIndexConnectionResolver, error) {
-	return nil, codeIntelOnlyInEnterprise
-}
-
-func (defaultCodeIntelResolver) LSIFIndexesByRepo(ctx context.Context, args *LSIFRepositoryIndexesQueryArgs) (LSIFIndexConnectionResolver, error) {
-	return nil, codeIntelOnlyInEnterprise
-}
-
-func (defaultCodeIntelResolver) DeleteLSIFIndex(ctx context.Context, id graphql.ID) (*EmptyResponse, error) {
-	return nil, codeIntelOnlyInEnterprise
-}
-
-func (defaultCodeIntelResolver) GitBlobLSIFData(ctx context.Context, args *GitBlobLSIFDataArgs) (GitBlobLSIFDataResolver, error) {
-	return nil, codeIntelOnlyInEnterprise
-}
-
-func (r *schemaResolver) LSIFUploads(ctx context.Context, args *LSIFUploadsQueryArgs) (LSIFUploadConnectionResolver, error) {
-	return r.CodeIntelResolver.LSIFUploads(ctx, args)
-}
-
-func (r *schemaResolver) LSIFIndexes(ctx context.Context, args *LSIFIndexesQueryArgs) (LSIFIndexConnectionResolver, error) {
-	return r.CodeIntelResolver.LSIFIndexes(ctx, args)
-}
-
-func (r *schemaResolver) DeleteLSIFUpload(ctx context.Context, args *struct{ ID graphql.ID }) (*EmptyResponse, error) {
-	return r.CodeIntelResolver.DeleteLSIFUpload(ctx, args.ID)
-}
-
-func (r *schemaResolver) DeleteLSIFIndex(ctx context.Context, args *struct{ ID graphql.ID }) (*EmptyResponse, error) {
-	return r.CodeIntelResolver.DeleteLSIFIndex(ctx, args.ID)
+	NodeResolvers() map[string]NodeByIDFunc
 }
 
 type LSIFUploadsQueryArgs struct {
@@ -105,6 +53,7 @@ type LSIFUploadResolver interface {
 	FinishedAt() *DateTime
 	InputIndexer() string
 	PlaceInQueue() *int32
+	AssociatedIndex(ctx context.Context) (LSIFIndexResolver, error)
 	ProjectRoot(ctx context.Context) (*GitTreeEntryResolver, error)
 }
 
@@ -129,13 +78,38 @@ type LSIFRepositoryIndexesQueryArgs struct {
 type LSIFIndexResolver interface {
 	ID() graphql.ID
 	InputCommit() string
+	InputRoot() string
+	InputIndexer() string
 	QueuedAt() DateTime
 	State() string
 	Failure() *string
 	StartedAt() *DateTime
 	FinishedAt() *DateTime
+	Steps() IndexStepsResolver
 	PlaceInQueue() *int32
+	AssociatedUpload(ctx context.Context) (LSIFUploadResolver, error)
 	ProjectRoot(ctx context.Context) (*GitTreeEntryResolver, error)
+}
+
+type IndexStepsResolver interface {
+	Setup() []ExecutionLogEntryResolver
+	PreIndex() []PreIndexStepResolver
+	Index() IndexStepResolver
+	Upload() ExecutionLogEntryResolver
+	Teardown() []ExecutionLogEntryResolver
+}
+
+type PreIndexStepResolver interface {
+	Root() string
+	Image() string
+	Commands() []string
+	LogEntry() ExecutionLogEntryResolver
+}
+
+type IndexStepResolver interface {
+	IndexerArgs() []string
+	Outfile() *string
+	LogEntry() ExecutionLogEntryResolver
 }
 
 type LSIFIndexConnectionResolver interface {
@@ -144,8 +118,30 @@ type LSIFIndexConnectionResolver interface {
 	PageInfo(ctx context.Context) (*graphqlutil.PageInfo, error)
 }
 
+type IndexConfigurationResolver interface {
+	Configuration() *string
+}
+
+type UpdateRepositoryIndexConfigurationArgs struct {
+	Repository    graphql.ID
+	Configuration string
+}
+
+type QueueAutoIndexJobArgs struct {
+	Repository graphql.ID
+}
+
 type GitTreeLSIFDataResolver interface {
 	Diagnostics(ctx context.Context, args *LSIFDiagnosticsArgs) (DiagnosticConnectionResolver, error)
+	DocumentationPage(ctx context.Context, args *LSIFDocumentationPageArgs) (DocumentationPageResolver, error)
+	DocumentationPathInfo(ctx context.Context, args *LSIFDocumentationPathInfoArgs) (JSONValue, error)
+	DocumentationDefinitions(ctx context.Context, args *LSIFQueryDocumentationArgs) (LocationConnectionResolver, error)
+	DocumentationReferences(ctx context.Context, args *LSIFPagedQueryDocumentationArgs) (LocationConnectionResolver, error)
+}
+
+type CodeIntelligenceCommitGraphResolver interface {
+	Stale(ctx context.Context) (bool, error)
+	UpdatedAt(ctx context.Context) (*DateTime, error)
 }
 
 type GitBlobLSIFDataResolver interface {
@@ -157,6 +153,7 @@ type GitBlobLSIFDataResolver interface {
 	Definitions(ctx context.Context, args *LSIFQueryPositionArgs) (LocationConnectionResolver, error)
 	References(ctx context.Context, args *LSIFPagedQueryPositionArgs) (LocationConnectionResolver, error)
 	Hover(ctx context.Context, args *LSIFQueryPositionArgs) (HoverResolver, error)
+	Documentation(ctx context.Context, args *LSIFQueryPositionArgs) (DocumentationResolver, error)
 }
 
 type GitBlobLSIFDataArgs struct {
@@ -183,6 +180,16 @@ type LSIFPagedQueryPositionArgs struct {
 	After *string
 }
 
+type LSIFQueryDocumentationArgs struct {
+	PathID string
+}
+
+type LSIFPagedQueryDocumentationArgs struct {
+	PathID string
+	graphqlutil.ConnectionArgs
+	After *string
+}
+
 type LSIFDiagnosticsArgs struct {
 	graphqlutil.ConnectionArgs
 }
@@ -196,6 +203,7 @@ type CodeIntelligenceRangeResolver interface {
 	Definitions(ctx context.Context) (LocationConnectionResolver, error)
 	References(ctx context.Context) (LocationConnectionResolver, error)
 	Hover(ctx context.Context) (HoverResolver, error)
+	Documentation(ctx context.Context) (DocumentationResolver, error)
 }
 
 type LocationConnectionResolver interface {
@@ -204,8 +212,12 @@ type LocationConnectionResolver interface {
 }
 
 type HoverResolver interface {
-	Markdown() MarkdownResolver
+	Markdown() Markdown
 	Range() RangeResolver
+}
+
+type DocumentationResolver interface {
+	PathID() string
 }
 
 type DiagnosticConnectionResolver interface {

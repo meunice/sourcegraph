@@ -11,7 +11,7 @@ indent_size = 4
 [*.go]
 indent_style = tab
 
-[{*.js,*.json,*.yml,*.md,.babelrc,.stylelintrc}]
+[{*.js,*.jsx,*.json,*.yml,*.yaml,*.md,.babelrc,.stylelintrc}]
 indent_size = 2
 
 [*.md]
@@ -23,4 +23,8 @@ indent_size = 2
 switch_case_indent = true
 
 [**/node_modules/**]
+ignore = true
+
+# shfmt shouldn't format third-party script codecov.sh
+[dev/ci/codecov.sh]
 ignore = true

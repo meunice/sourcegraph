@@ -2,8 +2,9 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"io"
-	"io/ioutil"
+	"io/fs"
 	"log"
 	"os"
 	"os/exec"
@@ -15,7 +16,14 @@ import (
 	"testing/quick"
 	"time"
 
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
+	"github.com/google/go-cmp/cmp"
+
+	"github.com/sourcegraph/sourcegraph/internal/api"
+	"github.com/sourcegraph/sourcegraph/internal/database"
+	"github.com/sourcegraph/sourcegraph/internal/database/dbtesting"
+	"github.com/sourcegraph/sourcegraph/internal/gitserver/protocol"
+	"github.com/sourcegraph/sourcegraph/internal/types"
 )
 
 const (
@@ -23,8 +31,66 @@ const (
 	testRepoC = "testrepo-C"
 )
 
+func TestCleanup_computeStats(t *testing.T) {
+	root, err := os.MkdirTemp("", "gitserver-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+
+	for _, name := range []string{"a", "b/d", "c"} {
+		p := path.Join(root, name, ".git")
+		if err := os.MkdirAll(p, 0755); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command("git", "--bare", "init", p)
+		if err := cmd.Run(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	want := protocol.ReposStats{
+		UpdatedAt: time.Now(),
+
+		// This may be different in practice, but the way we setup the tests
+		// we only have .git dirs to measure so this is correct.
+		GitDirBytes: dirSize(root),
+	}
+
+	// We run cleanupRepos because we want to test as a side-effect it creates
+	// the correct file in the correct place.
+	s := &Server{ReposDir: root}
+	s.Handler() // Handler as a side-effect sets up Server
+	s.cleanupRepos()
+
+	// we hardcode the name here so the tests break if someone changes the
+	// value of reposStatsName. We don't want it to change without good reason
+	// since it will temporarily break the repo-stats endpoint.
+	b, err := os.ReadFile(filepath.Join(root, "repos-stats.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got protocol.ReposStats
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	if got.UpdatedAt.Before(want.UpdatedAt) {
+		t.Fatal("want should have been computed after we called cleanupRepos")
+	}
+	if got.UpdatedAt.After(time.Now()) {
+		t.Fatal("want.UpdatedAt is in the future")
+	}
+	got.UpdatedAt = want.UpdatedAt
+
+	if d := cmp.Diff(want, got); d != "" {
+		t.Fatalf("mismatch for (-want +got):\n%s", d)
+	}
+}
+
 func TestCleanupInactive(t *testing.T) {
-	root, err := ioutil.TempDir("", "gitserver-test-")
+	root, err := os.MkdirTemp("", "gitserver-test-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +106,7 @@ func TestCleanupInactive(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := &Server{ReposDir: root, DeleteStaleRepositories: true}
+	s := &Server{ReposDir: root}
 	s.Handler() // Handler as a side-effect sets up Server
 	s.cleanupRepos()
 
@@ -52,8 +118,63 @@ func TestCleanupInactive(t *testing.T) {
 	}
 }
 
+// Note that the exact values (e.g. 50 commits) below are related to git's
+// internal heuristics regarding whether or not to invoke `git gc --auto`.
+//
+// They are stable today, but may become flaky in the future if/when the
+// relevant internal magic numbers and transformations change.
+func TestGitGCAuto(t *testing.T) {
+	// Create a test repository with detectable garbage that GC can prune.
+	root := t.TempDir()
+	repo := filepath.Join(root, "garbage-repo")
+	defer os.RemoveAll(root)
+	runCmd(t, root, "git", "init", repo)
+
+	// First we need to generate a moderate number of commits.
+	for i := 0; i < 50; i++ {
+		runCmd(t, repo, "sh", "-c", "echo 1 >> file1")
+		runCmd(t, repo, "git", "add", "file1")
+		runCmd(t, repo, "git", "commit", "-m", "file1")
+	}
+
+	// Now on a second branch, we do the same thing.
+	runCmd(t, repo, "git", "checkout", "-b", "secondary")
+	for i := 0; i < 50; i++ {
+		runCmd(t, repo, "sh", "-c", "echo 2 >> file2")
+		runCmd(t, repo, "git", "add", "file2")
+		runCmd(t, repo, "git", "commit", "-m", "file2")
+	}
+
+	// Bring everything back together in one branch.
+	runCmd(t, repo, "git", "checkout", "master")
+	runCmd(t, repo, "git", "merge", "secondary")
+
+	// `git count-objects -v` can indicate objects, packs, etc.
+	// We'll run this before and after to verify that an action
+	// was taken by `git gc --auto`.
+	countObjects := func() string {
+		t.Helper()
+		return runCmd(t, repo, "git", "count-objects", "-v")
+	}
+
+	// Verify that we have GC-able objects in the repository.
+	if strings.Contains(countObjects(), "count: 0") {
+		t.Fatalf("expected git to report objects but none found")
+	}
+
+	// Handler must be invoked for Server side-effects.
+	s := &Server{ReposDir: root}
+	s.Handler()
+	s.cleanupRepos()
+
+	// Verify that there are no more GC-able objects in the repository.
+	if !strings.Contains(countObjects(), "count: 0") {
+		t.Fatalf("expected git to report no objects, but found some")
+	}
+}
+
 func TestCleanupExpired(t *testing.T) {
-	root, err := ioutil.TempDir("", "gitserver-test-")
+	root, err := os.MkdirTemp("", "gitserver-test-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,22 +186,30 @@ func TestCleanupExpired(t *testing.T) {
 	repoGCOld := path.Join(root, "repo-gc-old", ".git")
 	repoBoom := path.Join(root, "repo-boom", ".git")
 	repoCorrupt := path.Join(root, "repo-corrupt", ".git")
+	repoPerforce := path.Join(root, "repo-perforce", ".git")
+	repoPerforceGCOld := path.Join(root, "repo-perforce-gc-old", ".git")
+	repoRemoteURLScrub := path.Join(root, "repo-remote-url-scrub", ".git")
 	remote := path.Join(root, "remote", ".git")
-	for _, path := range []string{repoNew, repoOld, repoGCNew, repoGCOld, repoBoom, repoCorrupt, remote} {
+	for _, path := range []string{
+		repoNew, repoOld,
+		repoGCNew, repoGCOld,
+		repoBoom, repoCorrupt,
+		repoPerforce, repoPerforceGCOld,
+		repoRemoteURLScrub,
+		remote,
+	} {
 		cmd := exec.Command("git", "--bare", "init", path)
 		if err := cmd.Run(); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	origRepoRemoteURL := repoRemoteURL
-	repoRemoteURL = func(ctx context.Context, dir GitDir) (string, error) {
-		if string(dir) == repoBoom {
+	getRemoteURL := func(ctx context.Context, name api.RepoName) (string, error) {
+		if name == "repo-boom" {
 			return "", errors.Errorf("boom")
 		}
 		return remote, nil
 	}
-	defer func() { repoRemoteURL = origRepoRemoteURL }()
 
 	modTime := func(path string) time.Time {
 		t.Helper()
@@ -103,10 +232,12 @@ func TestCleanupExpired(t *testing.T) {
 	writeFile(t, filepath.Join(repoGCOld, "gc.log"), []byte("warning: There are too many unreachable loose objects; run 'git prune' to remove them."))
 
 	for path, delta := range map[string]time.Duration{
-		repoOld:     2 * repoTTL,
-		repoGCOld:   2 * repoTTLGC,
-		repoBoom:    2 * repoTTL,
-		repoCorrupt: repoTTLGC / 2, // should only trigger corrupt, not old
+		repoOld:           2 * repoTTL,
+		repoGCOld:         2 * repoTTLGC,
+		repoBoom:          2 * repoTTL,
+		repoCorrupt:       repoTTLGC / 2, // should only trigger corrupt, not old
+		repoPerforce:      2 * repoTTL,
+		repoPerforceGCOld: 2 * repoTTLGC,
 	} {
 		ts := time.Now().Add(-delta)
 		if err := setRecloneTime(GitDir(path), ts); err != nil {
@@ -116,7 +247,16 @@ func TestCleanupExpired(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := gitConfigSet(GitDir(repoCorrupt), "sourcegraph.maybeCorruptRepo", "1"); err != nil {
+	if err := gitConfigSet(GitDir(repoCorrupt), gitConfigMaybeCorrupt, "1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := setRepositoryType(GitDir(repoPerforce), "perforce"); err != nil {
+		t.Fatal(err)
+	}
+	if err := setRepositoryType(GitDir(repoPerforceGCOld), "perforce"); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.Command("git", "-C", repoRemoteURLScrub, "remote", "add", "origin", "http://hello:world@boom.com/").Run(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -126,19 +266,33 @@ func TestCleanupExpired(t *testing.T) {
 	repoGCNewTime := modTime(repoGCNew)
 	repoGCOldTime := modTime(repoGCOld)
 	repoCorruptTime := modTime(repoBoom)
+	repoPerforceTime := modTime(repoPerforce)
+	repoPerforceGCOldTime := modTime(repoPerforceGCOld)
 	repoBoomTime := modTime(repoBoom)
 	repoBoomRecloneTime := recloneTime(repoBoom)
 
-	s := &Server{ReposDir: root}
+	s := &Server{
+		ReposDir:         root,
+		GetRemoteURLFunc: getRemoteURL,
+		GetVCSSyncer: func(ctx context.Context, name api.RepoName) (VCSSyncer, error) {
+			return &GitRepoSyncer{}, nil
+		},
+	}
 	s.Handler() // Handler as a side-effect sets up Server
 	s.cleanupRepos()
 
-	// repos that shouldn't be recloned
+	// repos that shouldn't be re-cloned
 	if repoNewTime.Before(modTime(repoNew)) {
 		t.Error("expected repoNew to not be modified")
 	}
 	if repoGCNewTime.Before(modTime(repoGCNew)) {
 		t.Error("expected repoGCNew to not be modified")
+	}
+	if repoPerforceTime.Before(modTime(repoPerforce)) {
+		t.Error("expected repoPerforce to not be modified")
+	}
+	if repoPerforceGCOldTime.Before(modTime(repoPerforceGCOld)) {
+		t.Error("expected repoPerforceGCOld to not be modified")
 	}
 
 	// repos that should be recloned
@@ -154,7 +308,7 @@ func TestCleanupExpired(t *testing.T) {
 
 	// repos that fail to clone need to have recloneTime updated
 	if repoBoomTime.Before(modTime(repoBoom)) {
-		t.Fatal("expected repoBoom to fail to reclone due to hardcoding getRemoteURL failure")
+		t.Fatal("expected repoBoom to fail to re-clone due to hardcoding getRemoteURL failure")
 	}
 	if !repoBoomRecloneTime.Before(recloneTime(repoBoom)) {
 		t.Error("expected repoBoom reclone time to be updated")
@@ -162,10 +316,17 @@ func TestCleanupExpired(t *testing.T) {
 	if !now.After(recloneTime(repoBoom)) {
 		t.Error("expected repoBoom reclone time to be updated to not now")
 	}
+
+	// we scrubbed remote URL
+	if out, err := exec.Command("git", "-C", repoRemoteURLScrub, "remote", "-v").Output(); len(out) > 0 {
+		t.Fatalf("expected no output from git remote after URL scrubbing, got: %s", out)
+	} else if err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestCleanupOldLocks(t *testing.T) {
-	root := tmpDir(t)
+	root := t.TempDir()
 
 	// Only recent lock files should remain.
 	mkFiles(t, root,
@@ -205,6 +366,8 @@ func TestCleanupOldLocks(t *testing.T) {
 	s.cleanupRepos()
 
 	assertPaths(t, root,
+		"repos-stats.json",
+
 		"github.com/foo/empty/.git/HEAD",
 		"github.com/foo/empty/.git/info/attributes",
 
@@ -231,7 +394,7 @@ func TestCleanupOldLocks(t *testing.T) {
 }
 
 func TestSetupAndClearTmp(t *testing.T) {
-	root := tmpDir(t)
+	root := t.TempDir()
 
 	s := &Server{ReposDir: root}
 
@@ -271,7 +434,7 @@ func TestSetupAndClearTmp(t *testing.T) {
 	// Wait until async cleaning is done
 	for i := 0; i < 1000; i++ {
 		found := false
-		files, err := ioutil.ReadDir(s.ReposDir)
+		files, err := os.ReadDir(s.ReposDir)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -293,7 +456,7 @@ func TestSetupAndClearTmp(t *testing.T) {
 }
 
 func TestSetupAndClearTmp_Empty(t *testing.T) {
-	root := tmpDir(t)
+	root := t.TempDir()
 
 	s := &Server{ReposDir: root}
 
@@ -307,19 +470,50 @@ func TestSetupAndClearTmp_Empty(t *testing.T) {
 }
 
 func TestRemoveRepoDirectory(t *testing.T) {
-	root := tmpDir(t)
+	root := t.TempDir()
 
 	mkFiles(t, root,
 		"github.com/foo/baz/.git/HEAD",
-		"github.com/foo/survior/.git/HEAD",
+		"github.com/foo/survivor/.git/HEAD",
 		"github.com/bam/bam/.git/HEAD",
 		"example.com/repo/.git/HEAD",
 	)
-	s := &Server{
-		ReposDir: root,
+
+	// Set them up in the DB
+	ctx := context.Background()
+	db := dbtesting.GetDB(t)
+
+	idMapping := make(map[api.RepoName]api.RepoID)
+
+	// Set them all as cloned in the DB
+	for _, r := range []string{
+		"github.com/foo/baz",
+		"github.com/foo/survivor",
+		"github.com/bam/bam",
+		"example.com/repo",
+	} {
+		repo := &types.Repo{
+			Name: api.RepoName(r),
+		}
+		if err := database.Repos(db).Create(ctx, repo); err != nil {
+			t.Fatal(err)
+		}
+		if err := database.GitserverRepos(db).Upsert(ctx, &types.GitserverRepo{
+			RepoID:      repo.ID,
+			ShardID:     "test",
+			CloneStatus: types.CloneStatusCloned,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		idMapping[repo.Name] = repo.ID
 	}
 
-	// Remove everything but github.com/foo/survior
+	s := &Server{
+		ReposDir: root,
+		DB:       db,
+	}
+
+	// Remove everything but github.com/foo/survivor
 	for _, d := range []string{
 		"github.com/foo/baz/.git",
 		"github.com/bam/bam/.git",
@@ -331,13 +525,35 @@ func TestRemoveRepoDirectory(t *testing.T) {
 	}
 
 	assertPaths(t, root,
-		"github.com/foo/survior/.git/HEAD",
+		"github.com/foo/survivor/.git/HEAD",
 		".tmp",
 	)
+
+	for _, tc := range []struct {
+		name   api.RepoName
+		status types.CloneStatus
+	}{
+		{"github.com/foo/baz", types.CloneStatusNotCloned},
+		{"github.com/bam/bam", types.CloneStatusNotCloned},
+		{"example.com/repo", types.CloneStatusNotCloned},
+		{"github.com/foo/survivor", types.CloneStatusCloned},
+	} {
+		id, ok := idMapping[tc.name]
+		if !ok {
+			t.Fatal("id mapping not found")
+		}
+		r, err := database.GitserverRepos(db).GetByID(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.CloneStatus != tc.status {
+			t.Errorf("Want %q, got %q for %q", tc.status, r.CloneStatus, tc.name)
+		}
+	}
 }
 
 func TestRemoveRepoDirectory_Empty(t *testing.T) {
-	root := tmpDir(t)
+	root := t.TempDir()
 
 	mkFiles(t, root,
 		"github.com/foo/baz/.git/HEAD",
@@ -417,16 +633,6 @@ func (f *fakeDiskSizer) DiskSizeBytes(mountPoint string) (uint64, error) {
 	return f.diskSize, nil
 }
 
-func tmpDir(t *testing.T) string {
-	t.Helper()
-	dir, err := ioutil.TempDir("", filepath.Base(t.Name()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
-	return dir
-}
-
 func mkFiles(t *testing.T, root string, paths ...string) {
 	t.Helper()
 	for _, p := range paths {
@@ -439,7 +645,7 @@ func mkFiles(t *testing.T, root string, paths ...string) {
 
 func writeFile(t *testing.T, path string, content []byte) {
 	t.Helper()
-	err := ioutil.WriteFile(path, content, 0666)
+	err := os.WriteFile(path, content, 0666)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -453,7 +659,7 @@ func assertPaths(t *testing.T, root string, want ...string) {
 		notfound[p] = struct{}{}
 	}
 	var unwanted []string
-	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+	err := filepath.Walk(root, func(path string, info fs.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -522,7 +728,7 @@ func TestFreeUpSpace(t *testing.T) {
 	})
 	t.Run("oldest repo gets removed to free up space", func(t *testing.T) {
 		// Set up.
-		rd, err := ioutil.TempDir("", "freeUpSpace")
+		rd, err := os.MkdirTemp("", "freeUpSpace")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -558,10 +764,7 @@ func TestFreeUpSpace(t *testing.T) {
 			".tmp",
 			"repo2/.git/HEAD",
 			"repo2/.git/space_eater")
-		rds, err := dirSize(rd)
-		if err != nil {
-			t.Fatal(err)
-		}
+		rds := dirSize(rd)
 		wantSize := int64(1000)
 		if rds > wantSize {
 			t.Errorf("repo dir size is %d, want no more than %d", rds, wantSize)
@@ -574,10 +777,10 @@ func makeFakeRepo(d string, sizeBytes int) error {
 	if err := os.MkdirAll(gd, 0700); err != nil {
 		return errors.Wrap(err, "creating .git dir and any parents")
 	}
-	if err := ioutil.WriteFile(filepath.Join(gd, "HEAD"), nil, 0666); err != nil {
+	if err := os.WriteFile(filepath.Join(gd, "HEAD"), nil, 0666); err != nil {
 		return errors.Wrap(err, "creating HEAD file")
 	}
-	if err := ioutil.WriteFile(filepath.Join(gd, "space_eater"), make([]byte, sizeBytes), 0666); err != nil {
+	if err := os.WriteFile(filepath.Join(gd, "space_eater"), make([]byte, sizeBytes), 0666); err != nil {
 		return errors.Wrapf(err, "writing to space_eater file")
 	}
 	return nil

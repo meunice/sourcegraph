@@ -1,13 +1,63 @@
 package query
 
 import (
-	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
-	"github.com/src-d/enry/v2"
+	"github.com/cockroachdb/errors"
+	"github.com/go-enry/go-enry/v2"
+
+	"github.com/sourcegraph/sourcegraph/internal/search/filter"
 )
+
+// IsBasic returns whether a query is a basic query. A basic query is one which
+// does not have a DNF-expansion. I.e., there is only one disjunct. A basic
+// query implies that it has no subexpressions that we need to evaluate. IsBasic
+// is used in our codebase where legacy code has not been updated to handle
+// queries with multiple expressions (like alerts), and assume only one
+// evaluatable query.
+func IsBasic(nodes []Node) bool {
+	return len(Dnf(nodes)) == 1
+}
+
+// IsPatternAtom returns whether a node is a non-negated pattern atom.
+func IsPatternAtom(b Basic) bool {
+	if b.Pattern == nil {
+		return true
+	}
+	if p, ok := b.Pattern.(Pattern); ok && !p.Negated {
+		return true
+	}
+	return false
+}
+
+// IsStreamingCompatible returns whether a backend search process may
+// immediately send results over a streaming interface. A query is streaming
+// compatible if a streaming search engine component (like git-powered commit
+// search or Zoekt) may assume that it's processing just one logical search
+// expression which is not subject to additional merge/deduplication processing,
+// which are otherwise required by `and` and `or` expressions in the Sourcegraph
+// query evaluation routine. A single logical search expression is represented
+// by a single Basic query which contains either no pattern node, or a single
+// pattern node.
+func IsStreamingCompatible(p Plan) bool {
+	if len(p) == 1 {
+		if p[0].Pattern == nil {
+			return true
+		}
+		switch node := p[0].Pattern.(type) {
+		case Operator:
+			if len(node.Operands) == 1 {
+				return true
+			}
+		case Pattern:
+			return true
+		}
+	}
+	return false
+}
 
 // exists traverses every node in nodes and returns early as soon as fn is satisfied.
 func exists(nodes []Node, fn func(node Node) bool) bool {
@@ -17,7 +67,9 @@ func exists(nodes []Node, fn func(node Node) bool) bool {
 			return true
 		}
 		if operator, ok := node.(Operator); ok {
-			return exists(operator.Operands, fn)
+			if exists(operator.Operands, fn) {
+				return true
+			}
 		}
 	}
 	return found
@@ -53,22 +105,6 @@ func containsPattern(node Node) bool {
 		_, ok := node.(Pattern)
 		return ok
 	})
-}
-
-// returns true if descendent of node contains and/or expressions.
-func containsAndOrExpression(nodes []Node) bool {
-	return exists(nodes, func(node Node) bool {
-		term, ok := node.(Operator)
-		return ok && (term.Kind == And || term.Kind == Or)
-	})
-}
-
-// ContainsAndOrKeyword returns true if this query contains or- or and-
-// keywords. It is a temporary signal to determine whether we can fallback to
-// the older existing search functionality.
-func ContainsAndOrKeyword(input string) bool {
-	lower := strings.ToLower(input)
-	return strings.Contains(lower, " and ") || strings.Contains(lower, " or ")
 }
 
 // ContainsRegexpMetasyntax returns true if a string is a valid regular
@@ -109,7 +145,7 @@ func processTopLevel(nodes []Node) ([]Node, error) {
 // search patterns (e.g., to repos, files, etc.). It validates that a query
 // contains at most one search pattern expression and that scope parameters do
 // not contain nested expressions.
-func PartitionSearchPattern(nodes []Node) (parameters []Node, pattern Node, err error) {
+func PartitionSearchPattern(nodes []Node) (parameters []Parameter, pattern Node, err error) {
 	if len(nodes) == 1 {
 		nodes, err = processTopLevel(nodes)
 		if err != nil {
@@ -136,34 +172,6 @@ func PartitionSearchPattern(nodes []Node) (parameters []Node, pattern Node, err 
 	return parameters, pattern, nil
 }
 
-// isPureSearchPattern implements a heuristic that returns true if buf, possibly
-// containing whitespace or balanced parentheses, can be treated as a search
-// pattern in the and/or grammar.
-func isPureSearchPattern(buf []byte) bool {
-	// Check if the balanced string we scanned is perhaps an and/or expression by parsing without the parensAsPatterns heuristic.
-	try := &parser{buf: buf}
-	result, err := try.parseOr()
-	if err != nil {
-		// This is not an and/or expression, but it is balanced. It
-		// could be, e.g., (foo or). Reject this sort of pattern for now.
-		return false
-	}
-	if try.balanced != 0 {
-		return false
-	}
-	if containsAndOrExpression(result) {
-		// The balanced string is an and/or expression in our grammar,
-		// so it cannot be interpreted as a search pattern.
-		return false
-	}
-	if !isPatternExpression(newOperator(result, Concat)) {
-		// The balanced string contains other parameters, like
-		// "repo:foo", which are not search patterns.
-		return false
-	}
-	return true
-}
-
 // parseBool is like strconv.ParseBool except that it also accepts y, Y, yes,
 // YES, Yes, n, N, no, NO, No.
 func parseBool(s string) (bool, error) {
@@ -175,7 +183,7 @@ func parseBool(s string) (bool, error) {
 	default:
 		b, err := strconv.ParseBool(s)
 		if err != nil {
-			err = fmt.Errorf("invalid boolean %q", s)
+			err = errors.Errorf("invalid boolean %q", s)
 		}
 		return b, err
 	}
@@ -184,14 +192,14 @@ func parseBool(s string) (bool, error) {
 func validateField(field, value string, negated bool, seen map[string]struct{}) error {
 	isNotNegated := func() error {
 		if negated {
-			return fmt.Errorf("field %q does not support negation", field)
+			return errors.Errorf("field %q does not support negation", field)
 		}
 		return nil
 	}
 
 	isSingular := func() error {
 		if _, notSingular := seen[field]; notSingular {
-			return fmt.Errorf("field %q may not be used more than once", field)
+			return errors.Errorf("field %q may not be used more than once", field)
 		}
 		return nil
 	}
@@ -213,13 +221,21 @@ func validateField(field, value string, negated bool, seen map[string]struct{}) 
 	isNumber := func() error {
 		count, err := strconv.ParseInt(value, 10, 32)
 		if err != nil {
-			if err.(*strconv.NumError).Err == strconv.ErrRange {
-				return fmt.Errorf("field %s has a value that is out of range, try making it smaller", field)
+			if errors.Is(err, strconv.ErrRange) {
+				return errors.Errorf("field %s has a value that is out of range, try making it smaller", field)
 			}
-			return fmt.Errorf("field %s has value %[2]s, %[2]s is not a number", field, value)
+			return errors.Errorf("field %s has value %[2]s, %[2]s is not a number", field, value)
 		}
 		if count <= 0 {
-			return fmt.Errorf("field %s requires a positive number", field)
+			return errors.Errorf("field %s requires a positive number", field)
+		}
+		return nil
+	}
+
+	isDuration := func() error {
+		_, err := time.ParseDuration(value)
+		if err != nil {
+			return errors.New(`invalid value for field 'timeout' (examples: "timeout:2s", "timeout:200ms")`)
 		}
 		return nil
 	}
@@ -227,13 +243,26 @@ func validateField(field, value string, negated bool, seen map[string]struct{}) 
 	isLanguage := func() error {
 		_, ok := enry.GetLanguageByAlias(value)
 		if !ok {
-			return fmt.Errorf("unknown language: %q", value)
+			return errors.Errorf("unknown language: %q", value)
+		}
+		return nil
+	}
+
+	isYesNoOnly := func() error {
+		v := ParseYesNoOnly(value)
+		if v == Invalid {
+			return errors.Errorf("invalid value %q for field %q. Valid values are: yes, only, no", value, field)
 		}
 		return nil
 	}
 
 	isUnrecognizedField := func() error {
-		return fmt.Errorf("unrecognized field %q", field)
+		return errors.Errorf("unrecognized field %q", field)
+	}
+
+	isValidSelect := func() error {
+		_, err := filter.SelectPathFromString(value)
+		return err
 	}
 
 	satisfies := func(fns ...func() error) error {
@@ -256,15 +285,12 @@ func validateField(field, value string, negated bool, seen map[string]struct{}) 
 		FieldRepo:
 		return satisfies(isValidRegexp)
 	case
-		FieldRepoGroup:
+		FieldRepoGroup,
+		FieldContext:
 		return satisfies(isSingular, isNotNegated)
 	case
 		FieldFile:
 		return satisfies(isValidRegexp)
-	case
-		FieldFork,
-		FieldArchived:
-		return satisfies(isSingular, isNotNegated)
 	case
 		FieldLang:
 		return satisfies(isLanguage)
@@ -273,7 +299,8 @@ func validateField(field, value string, negated bool, seen map[string]struct{}) 
 		return satisfies(isNotNegated)
 	case
 		FieldPatternType,
-		FieldContent:
+		FieldContent,
+		FieldVisibility:
 		return satisfies(isSingular, isNotNegated)
 	case
 		FieldRepoHasFile:
@@ -291,43 +318,275 @@ func validateField(field, value string, negated bool, seen map[string]struct{}) 
 		FieldMessage:
 		return satisfies(isValidRegexp)
 	case
-		FieldIndex:
-		return satisfies(isSingular, isNotNegated)
+		FieldIndex,
+		FieldFork,
+		FieldArchived:
+		return satisfies(isSingular, isNotNegated, isYesNoOnly)
 	case
 		FieldCount:
 		return satisfies(isSingular, isNumber, isNotNegated)
 	case
-		FieldStable:
-		return satisfies(isSingular, isBoolean, isNotNegated)
-	case
-		FieldMax,
-		FieldTimeout,
-		FieldReplace,
 		FieldCombyRule:
 		return satisfies(isSingular, isNotNegated)
+	case
+		FieldTimeout:
+		return satisfies(isSingular, isNotNegated, isDuration)
+	case
+		FieldRev:
+		return satisfies(isSingular, isNotNegated)
+	case
+		FieldSelect:
+		return satisfies(isSingular, isNotNegated, isValidSelect)
 	default:
 		return isUnrecognizedField()
 	}
 	return nil
 }
 
-func validate(nodes []Node) error {
+// A query with a rev: filter is invalid if:
+// (1) a repo is specified with @, OR
+// (2) no repo is specified, OR
+// (3) an empty repo value is specified (i.e., repo:"").
+func validateRepoRevPair(nodes []Node) error {
+	var seenRepoWithCommit bool
+	var seenRepo bool
+	var seenEmptyRepo bool
+	VisitField(nodes, FieldRepo, func(value string, negated bool, _ Annotation) {
+		seenRepo = true
+		seenEmptyRepo = value == ""
+		if !negated && strings.ContainsRune(value, '@') {
+			seenRepoWithCommit = true
+		}
+	})
+	revSpecified := exists(nodes, func(node Node) bool {
+		n, ok := node.(Parameter)
+		if ok && n.Field == FieldRev {
+			return true
+		}
+		return false
+	})
+	if seenRepoWithCommit && revSpecified {
+		return errors.New("invalid syntax. You specified both @ and rev: for a" +
+			" repo: filter and I don't know how to interpret this. Remove either @ or rev: and try again")
+	}
+	if !seenRepo && revSpecified {
+		return errors.New("invalid syntax. The query contains `rev:` without `repo:`. Add a `repo:` filter and try again")
+	}
+	if seenEmptyRepo && revSpecified {
+		return errors.New("invalid syntax. The query contains `rev:` but `repo:` is empty. Add a non-empty `repo:` filter and try again")
+	}
+	return nil
+}
+
+// Queries containing commit parameters without type:diff or type:commit are not
+// valid. cf. https://docs.sourcegraph.com/code_search/reference/language#commit-parameter
+func validateCommitParameters(nodes []Node) error {
+	var seenCommitParam string
+	var typeCommitExists bool
+	VisitParameter(nodes, func(field, value string, _ bool, _ Annotation) {
+		if field == FieldAuthor || field == FieldBefore || field == FieldAfter || field == FieldMessage {
+			seenCommitParam = field
+		}
+		if field == FieldType && (value == "commit" || value == "diff") {
+			typeCommitExists = true
+		}
+	})
+	if seenCommitParam != "" && !typeCommitExists {
+		return errors.Errorf(`your query contains the field '%s', which requires type:commit or type:diff in the query`, seenCommitParam)
+	}
+	return nil
+}
+
+func validateTypeStructural(nodes []Node) error {
+	seenStructural := false
+	seenType := false
+	typeDiff := false
+	invalid := exists(nodes, func(node Node) bool {
+		if p, ok := node.(Pattern); ok && p.Annotation.Labels.IsSet(Structural) {
+			seenStructural = true
+		}
+		if p, ok := node.(Parameter); ok && p.Field == FieldType {
+			seenType = true
+			typeDiff = p.Value == "diff"
+		}
+		return seenStructural && seenType
+	})
+	if invalid {
+		basic := "this structural search query specifies `type:` and is not supported. Structural search syntax only applies to searching file contents"
+		if typeDiff {
+			basic = basic + " and is not currently supported for diff searches"
+		}
+		return errors.New(basic)
+	}
+	return nil
+}
+
+// validatePredicates validates predicate parameters with respect to their validation logic.
+func validatePredicates(nodes []Node) error {
+	var err error
+	VisitParameter(nodes, func(field, value string, negated bool, annotation Annotation) {
+		if err != nil {
+			return
+		}
+		if annotation.Labels.IsSet(IsPredicate) {
+			if negated {
+				err = errors.New("predicates do not currently support negation")
+				return
+			}
+			name, params := ParseAsPredicate(value)                // guaranteed to succeed
+			predicate := DefaultPredicateRegistry.Get(field, name) // guaranteed to succeed
+			if parseErr := predicate.ParseParams(params); parseErr != nil {
+				err = errors.Errorf("invalid predicate value: %s", parseErr)
+			}
+		}
+	})
+	return err
+}
+
+// validateRepoHasFile validates that the repohasfile parameter can be executed.
+// A query like `repohasfile:foo type:symbol patter-to-match-symbols` is
+// currently not supported.
+func validateRepoHasFile(nodes []Node) error {
+	var seenRepoHasFile, seenTypeSymbol bool
+	VisitParameter(nodes, func(field, value string, _ bool, _ Annotation) {
+		if field == FieldRepoHasFile {
+			seenRepoHasFile = true
+		}
+		if field == FieldType && strings.EqualFold(value, "symbol") {
+			seenTypeSymbol = true
+		}
+	})
+	if seenRepoHasFile && seenTypeSymbol {
+		return errors.New("repohasfile is not compatible for type:symbol. Subscribe to https://github.com/sourcegraph/sourcegraph/issues/4610 for updates")
+	}
+	return nil
+}
+
+// validatePureLiteralPattern checks that no pattern expression contains and/or
+// operators nested inside concat. It may happen that we interpret a query this
+// way due to ambiguity. If this happens, return an error message.
+func validatePureLiteralPattern(nodes []Node, balanced bool) error {
+	impure := exists(nodes, func(node Node) bool {
+		if operator, ok := node.(Operator); ok && operator.Kind == Concat {
+			for _, node := range operator.Operands {
+				if op, ok := node.(Operator); ok && (op.Kind == Or || op.Kind == And) {
+					return true
+				}
+			}
+		}
+		return false
+	})
+	if impure {
+		if !balanced {
+			return errors.New("this literal search query contains unbalanced parentheses. I tried to guess what you meant, but wasn't able to. Maybe you missed a parenthesis? Otherwise, try using the content: filter if the pattern is unbalanced")
+		}
+		return errors.New("i'm having trouble understanding that query. The combination of parentheses is the problem. Try using the content: filter to quote patterns that contain parentheses")
+	}
+	return nil
+}
+
+func validateParameters(nodes []Node) error {
 	var err error
 	seen := map[string]struct{}{}
-	VisitParameter(nodes, func(field, value string, negated bool) {
+	VisitParameter(nodes, func(field, value string, negated bool, _ Annotation) {
 		if err != nil {
 			return
 		}
 		err = validateField(field, value, negated, seen)
 		seen[field] = struct{}{}
 	})
-	VisitPattern(nodes, func(value string, _ bool, annotation Annotation) {
-		if annotation.Labels.isSet(Regexp) {
-			if err != nil {
-				return
-			}
+	return err
+}
+
+func validatePattern(nodes []Node) error {
+	var err error
+	VisitPattern(nodes, func(value string, negated bool, annotation Annotation) {
+		if err != nil {
+			return
+		}
+		if annotation.Labels.IsSet(Regexp) {
 			_, err = regexp.Compile(value)
+		}
+		if annotation.Labels.IsSet(Structural) && negated {
+			err = errors.New("the query contains a negated search pattern. Structural search does not support negated search patterns at the moment")
 		}
 	})
 	return err
+}
+
+func validate(nodes []Node) error {
+	succeeds := func(fns ...func([]Node) error) error {
+		for _, fn := range fns {
+			if err := fn(nodes); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	return succeeds(
+		validateParameters,
+		validatePattern,
+		validateRepoRevPair,
+		validateRepoHasFile,
+		validateCommitParameters,
+		validatePredicates,
+		validateTypeStructural,
+	)
+}
+
+type YesNoOnly string
+
+const (
+	Yes     YesNoOnly = "yes"
+	No      YesNoOnly = "no"
+	Only    YesNoOnly = "only"
+	Invalid YesNoOnly = "invalid"
+)
+
+func ParseYesNoOnly(s string) YesNoOnly {
+	switch s {
+	case "y", "Y", "yes", "YES", "Yes":
+		return Yes
+	case "n", "N", "no", "NO", "No":
+		return No
+	case "o", "only", "ONLY", "Only":
+		return Only
+	default:
+		if b, err := strconv.ParseBool(s); err == nil {
+			if b {
+				return Yes
+			}
+			return No
+		}
+		return Invalid
+	}
+}
+
+func ContainsRefGlobs(q Q) bool {
+	containsRefGlobs := false
+	if repoFilterValues, _ := q.Repositories(); len(repoFilterValues) > 0 {
+		for _, v := range repoFilterValues {
+			repoRev := strings.SplitN(v, "@", 2)
+			if len(repoRev) == 1 { // no revision
+				continue
+			}
+			if ContainsNoGlobSyntax(repoRev[1]) {
+				continue
+			}
+			containsRefGlobs = true
+			break
+		}
+	}
+	return containsRefGlobs
+}
+
+func HasTypeRepo(q Q) bool {
+	found := false
+	VisitField(q, "type", func(value string, _ bool, _ Annotation) {
+		if value == "repo" {
+			found = true
+		}
+	})
+	return found
 }

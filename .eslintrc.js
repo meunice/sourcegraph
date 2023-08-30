@@ -13,6 +13,7 @@ const config = {
     ecmaFeatures: {
       jsx: true,
     },
+    EXPERIMENTAL_useSourceOfProjectReferenceRedirect: true,
     project: __dirname + '/tsconfig.json',
   },
   settings: {
@@ -30,9 +31,12 @@ const config = {
       },
     ],
   },
+  plugins: ['@sourcegraph/sourcegraph', 'monorepo'],
   rules: {
     // Rules that are specific to this repo
     // All other rules should go into https://github.com/sourcegraph/eslint-config
+    'monorepo/no-relative-import': 'error',
+    '@sourcegraph/sourcegraph/check-help-links': 'error',
     'no-restricted-imports': [
       'error',
       {
@@ -44,6 +48,14 @@ const config = {
             name: 'rxjs',
             importNames: ['animationFrameScheduler'],
             message: 'Code using animationFrameScheduler breaks in Firefox when using Sentry.',
+          },
+        ],
+        patterns: [
+          {
+            group: ['**/enterprise/*'],
+            message: `The OSS product may not pull in any code from the enterprise codebase, to stay a 100% open-source program.
+
+See https://about.sourcegraph.com/community/faq#is-all-of-sourcegraph-open-source for more information.`,
           },
         ],
       },
@@ -60,6 +72,7 @@ const config = {
         ],
       },
     ],
+    'react/jsx-no-target-blank': ['error', { allowReferrer: true }],
   },
   overrides: [
     {

@@ -1,9 +1,4 @@
-FROM alpine:3.10@sha256:e4355b66995c96b4b468159fc5c7e3540fcef961189ca13fee877798649f531a as libsqlite3-pcre
-
-COPY libsqlite3-pcre-install-alpine.sh /libsqlite3-pcre-install-alpine.sh
-RUN /libsqlite3-pcre-install-alpine.sh
-
-FROM sourcegraph/alpine:3.10@sha256:4d05cd5669726fc38823e92320659a6d1ef7879e62268adec5df658a0bacf65c
+FROM sourcegraph/alpine-3.12:99421_2021-06-16_8e20ec8@sha256:838b96d93f073aa773718e22be54362b721569e360b445675f4cab904abc9304
 
 ARG COMMIT_SHA="unknown"
 ARG DATE="unknown"
@@ -17,12 +12,6 @@ LABEL com.sourcegraph.github.url=https://github.com/sourcegraph/sourcegraph/comm
 # hadolint ignore=DL3018
 RUN apk update && apk add --no-cache \
     tini
-
-# hadolint ignore=DL3022
-COPY --from=libsqlite3-pcre /sqlite3-pcre/pcre.so /libsqlite3-pcre.so
-ENV LIBSQLITE3_PCRE /libsqlite3-pcre.so
-# hadolint ignore=DL3018
-RUN apk --no-cache add pcre-dev
 
 USER sourcegraph
 EXPOSE 3188

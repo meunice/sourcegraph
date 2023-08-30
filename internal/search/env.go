@@ -2,14 +2,15 @@ package search
 
 import (
 	"context"
-	"errors"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 
+	"github.com/cockroachdb/errors"
+	"github.com/google/zoekt"
 	"github.com/google/zoekt/query"
 	"github.com/google/zoekt/rpc"
+
 	"github.com/sourcegraph/sourcegraph/internal/conf"
 	"github.com/sourcegraph/sourcegraph/internal/endpoint"
 	"github.com/sourcegraph/sourcegraph/internal/env"
@@ -42,15 +43,20 @@ func SearcherURLs() *endpoint.Map {
 
 func Indexed() *backend.Zoekt {
 	indexedSearchOnce.Do(func() {
-		indexedSearch = &backend.Zoekt{}
+		var client zoekt.Streamer
 		if indexers := Indexers(); indexers.Enabled() {
-			indexedSearch.Client = backend.NewMeteredSearcher(&backend.HorizontalSearcher{
-				Map:  indexers.Map,
-				Dial: rpc.Client,
-			})
+			client = backend.NewMeteredSearcher(
+				"", // no hostname means its the aggregator
+				&backend.HorizontalSearcher{
+					Map:  indexers.Map,
+					Dial: backend.ZoektDial,
+				})
 		} else if addr := zoektAddr(os.Environ()); addr != "" {
-			indexedSearch.Client = backend.NewMeteredSearcher(rpc.Client(addr))
+			client = backend.ZoektDial(addr)
 		}
+
+		indexedSearch = &backend.Zoekt{Client: client}
+
 		conf.Watch(func() {
 			indexedSearch.SetEnabled(conf.SearchIndexEnabled())
 		})
@@ -60,7 +66,7 @@ func Indexed() *backend.Zoekt {
 
 func Indexers() *backend.Indexers {
 	indexersOnce.Do(func() {
-		if addr := zoektAddr(os.Environ()); addr != "" && !disableHorizontalSearch() {
+		if addr := zoektAddr(os.Environ()); addr != "" {
 			indexers = &backend.Indexers{
 				Map:     endpoint.New(addr),
 				Indexed: reposAtEndpoint,
@@ -72,12 +78,6 @@ func Indexers() *backend.Indexers {
 		}
 	})
 	return indexers
-}
-
-// escape hatch to disable new indexed-search code path. Can remove in 3.11
-func disableHorizontalSearch() bool {
-	v, _ := strconv.ParseBool(os.Getenv("DISABLE_HORIZONTAL_INDEXED_SEARCH"))
-	return v
 }
 
 func zoektAddr(environ []string) string {
@@ -109,7 +109,7 @@ func reposAtEndpoint(ctx context.Context, endpoint string) map[string]struct{} {
 	cl := rpc.Client(endpoint)
 	defer cl.Close()
 
-	resp, err := cl.List(ctx, &query.Const{Value: true})
+	resp, err := cl.List(ctx, &query.Const{Value: true}, nil)
 	if err != nil {
 		return map[string]struct{}{}
 	}

@@ -8,12 +8,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	otlog "github.com/opentracing/opentracing-go/log"
-	"github.com/pkg/errors"
+	"golang.org/x/time/rate"
+
 	"github.com/sourcegraph/sourcegraph/internal/api"
 	"github.com/sourcegraph/sourcegraph/internal/jsonc"
 	"github.com/sourcegraph/sourcegraph/schema"
-	"golang.org/x/time/rate"
 )
 
 // Account represents a row in the `user_external_accounts` table. See the GraphQL API's
@@ -79,7 +80,9 @@ const (
 	KindGitHub          = "GITHUB"
 	KindGitLab          = "GITLAB"
 	KindGitolite        = "GITOLITE"
+	KindPerforce        = "PERFORCE"
 	KindPhabricator     = "PHABRICATOR"
+	KindJVMPackages     = "JVMPACKAGES"
 	KindOther           = "OTHER"
 )
 
@@ -110,11 +113,19 @@ const (
 	// TypeGitolite is the (api.ExternalRepoSpec).ServiceType value for Gitolite projects.
 	TypeGitolite = "gitolite"
 
+	// TypePerforce is the (api.ExternalRepoSpec).ServiceType value for Perforce projects.
+	TypePerforce = "perforce"
+
 	// TypePhabricator is the (api.ExternalRepoSpec).ServiceType value for Phabricator projects.
 	TypePhabricator = "phabricator"
 
+	// TypeJVMPackages is the (api.ExternalRepoSpec).ServiceType value for Maven packages (Java/JVM ecosystem libraries).
+	TypeJVMPackages = "jvmPackages"
+
 	// TypeOther is the (api.ExternalRepoSpec).ServiceType value for other projects.
 	TypeOther = "other"
+
+	defaultRateLimit = rate.Limit(2)
 )
 
 // KindToType returns a Type constants given a Kind
@@ -135,6 +146,10 @@ func KindToType(kind string) string {
 		return TypeGitolite
 	case KindPhabricator:
 		return TypePhabricator
+	case KindPerforce:
+		return TypePerforce
+	case KindJVMPackages:
+		return TypeJVMPackages
 	case KindOther:
 		return TypeOther
 	default:
@@ -142,10 +157,40 @@ func KindToType(kind string) string {
 	}
 }
 
+// TypeToKind returns a Kind constants given a Type
+// It will panic when given an unknown type.
+func TypeToKind(t string) string {
+	switch t {
+	case TypeAWSCodeCommit:
+		return KindAWSCodeCommit
+	case TypeBitbucketServer:
+		return KindBitbucketServer
+	case TypeBitbucketCloud:
+		return KindBitbucketCloud
+	case TypeGitHub:
+		return KindGitHub
+	case TypeGitLab:
+		return KindGitLab
+	case TypeGitolite:
+		return KindGitolite
+	case TypePerforce:
+		return KindPerforce
+	case TypePhabricator:
+		return KindPhabricator
+	case TypeJVMPackages:
+		return KindJVMPackages
+	case TypeOther:
+		return KindOther
+	default:
+		panic(fmt.Sprintf("unknown type: %q", t))
+	}
+}
+
 var (
 	// Precompute these for use in ParseServiceType below since the constants are mixed case
 	bbsLower = strings.ToLower(TypeBitbucketServer)
 	bbcLower = strings.ToLower(TypeBitbucketCloud)
+	jvmLower = strings.ToLower(TypeJVMPackages)
 )
 
 // ParseServiceType will return a ServiceType constant after doing a case insensitive match on s.
@@ -164,10 +209,43 @@ func ParseServiceType(s string) (string, bool) {
 		return TypeGitLab, true
 	case TypeGitolite:
 		return TypeGitolite, true
+	case TypePerforce:
+		return TypePerforce, true
 	case TypePhabricator:
 		return TypePhabricator, true
+	case jvmLower:
+		return TypeJVMPackages, true
 	case TypeOther:
 		return TypeOther, true
+	default:
+		return "", false
+	}
+}
+
+// ParseServiceKind will return a ServiceKind constant after doing a case insensitive match on s.
+// It returns ("", false) if no match was found.
+func ParseServiceKind(s string) (string, bool) {
+	switch strings.ToUpper(s) {
+	case KindAWSCodeCommit:
+		return KindAWSCodeCommit, true
+	case KindBitbucketServer:
+		return KindBitbucketServer, true
+	case KindBitbucketCloud:
+		return KindBitbucketCloud, true
+	case KindGitHub:
+		return KindGitHub, true
+	case KindGitLab:
+		return KindGitLab, true
+	case KindGitolite:
+		return KindGitolite, true
+	case KindPerforce:
+		return KindPerforce, true
+	case KindPhabricator:
+		return KindPhabricator, true
+	case KindJVMPackages:
+		return KindJVMPackages, true
+	case KindOther:
+		return KindOther, true
 	default:
 		return "", false
 	}
@@ -182,6 +260,9 @@ type AccountID string
 // code host. It can be the string representation of an integer (e.g. GitLab and Bitbucket
 // Server) or a GraphQL ID (e.g. GitHub) depends on the code host type.
 type RepoID string
+
+// RepoIDType indicates the type of the RepoID.
+type RepoIDType string
 
 // ParseConfig attempts to unmarshal the given JSON config into a configuration struct defined in the schema package.
 func ParseConfig(kind, config string) (cfg interface{}, _ error) {
@@ -198,12 +279,16 @@ func ParseConfig(kind, config string) (cfg interface{}, _ error) {
 		cfg = &schema.GitLabConnection{}
 	case KindGitolite:
 		cfg = &schema.GitoliteConnection{}
+	case KindPerforce:
+		cfg = &schema.PerforceConnection{}
 	case KindPhabricator:
 		cfg = &schema.PhabricatorConnection{}
+	case KindJVMPackages:
+		cfg = &schema.JVMPackagesConnection{}
 	case KindOther:
 		cfg = &schema.OtherExternalServiceConnection{}
 	default:
-		return nil, fmt.Errorf("unknown external service kind %q", kind)
+		return nil, errors.Errorf("unknown external service kind %q", kind)
 	}
 	return cfg, jsonc.Unmarshal(config, cfg)
 }
@@ -217,11 +302,33 @@ func WebhookURL(kind string, externalServiceID int64, externalURL string) string
 		path = "github-webhooks"
 	case KindBitbucketServer:
 		path = "bitbucket-server-webhooks"
+	case KindGitLab:
+		path = "gitlab-webhooks"
 	default:
 		return ""
 	}
 	// eg. https://example.com/.api/github-webhooks?externalServiceID=1
 	return fmt.Sprintf("%s/.api/%s?%s=%d", externalURL, path, IDParam, externalServiceID)
+}
+
+// ExtractToken attempts to extract the token from the supplied args
+func ExtractToken(config string, kind string) (string, error) {
+	parsed, err := ParseConfig(kind, config)
+	if err != nil {
+		return "", errors.Wrap(err, "loading service configuration")
+	}
+	switch c := parsed.(type) {
+	case *schema.GitHubConnection:
+		return c.Token, nil
+	case *schema.GitLabConnection:
+		return c.Token, nil
+	case *schema.BitbucketServerConnection:
+		return c.Token, nil
+	case *schema.PhabricatorConnection:
+		return c.Token, nil
+	default:
+		return "", errors.Errorf("unable to extract token for service kind %q", kind)
+	}
 }
 
 // ExtractRateLimitConfig extracts the rate limit config from the given args. If rate limiting is not
@@ -239,42 +346,6 @@ func ExtractRateLimitConfig(config, kind, displayName string) (RateLimitConfig, 
 	rlc.DisplayName = displayName
 
 	return rlc, nil
-}
-
-// ExtractBaseURL will extract the normalised base URL from the given config
-// based on the vale of kind
-func ExtractBaseURL(kind, config string) (*url.URL, error) {
-	cfg, err := ParseConfig(kind, config)
-	if err != nil {
-		return nil, errors.Wrap(err, "parsing config")
-	}
-
-	var rawURL string
-	switch c := cfg.(type) {
-	case *schema.AWSCodeCommitConnection:
-		return nil, errors.New("BaseURL unavailable for AWSCodeCommit")
-	case *schema.BitbucketServerConnection:
-		rawURL = c.Url
-	case *schema.GitHubConnection:
-		rawURL = c.Url
-	case *schema.GitLabConnection:
-		rawURL = c.Url
-	case *schema.GitoliteConnection:
-		rawURL = c.Host
-	case *schema.PhabricatorConnection:
-		rawURL = c.Url
-	case *schema.OtherExternalServiceConnection:
-		rawURL = c.Url
-	default:
-		return nil, fmt.Errorf("unknown external service type %T", config)
-	}
-
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return nil, errors.Wrap(err, "parsing service URL")
-	}
-
-	return NormalizeBaseURL(parsed), nil
 }
 
 // RateLimitConfig represents the internal rate limit configured for an external service
@@ -319,13 +390,26 @@ func GetLimitFromConfig(kind string, config interface{}) (rlc RateLimitConfig, e
 		}
 		rlc.BaseURL = c.Url
 	case *schema.BitbucketCloudConnection:
-		// 2/s is the default limit we enforce
-		rlc.Limit = rate.Limit(2)
+		rlc.Limit = defaultRateLimit
 		if c != nil && c.RateLimit != nil {
 			rlc.Limit = limitOrInf(c.RateLimit.Enabled, c.RateLimit.RequestsPerHour)
 			rlc.IsDefault = false
 		}
 		rlc.BaseURL = c.Url
+	case *schema.PerforceConnection:
+		rlc.Limit = rate.Limit(5000.0 / 3600.0)
+		if c != nil && c.RateLimit != nil {
+			rlc.Limit = limitOrInf(c.RateLimit.Enabled, c.RateLimit.RequestsPerHour)
+			rlc.IsDefault = false
+		}
+		rlc.BaseURL = c.P4Port
+	case *schema.JVMPackagesConnection:
+		rlc.Limit = defaultRateLimit
+		if c != nil && c.Maven.RateLimit != nil {
+			rlc.Limit = limitOrInf(c.Maven.RateLimit.Enabled, c.Maven.RateLimit.RequestsPerHour)
+			rlc.IsDefault = false
+		}
+		rlc.BaseURL = "maven"
 	default:
 		return rlc, ErrRateLimitUnsupported{codehostKind: kind}
 	}
@@ -358,4 +442,79 @@ func (e ErrRateLimitUnsupported) Error() string {
 // URN returns a unique resource identifier of an external service by given kind and ID.
 func URN(kind string, id int64) string {
 	return "extsvc:" + strings.ToLower(kind) + ":" + strconv.FormatInt(id, 10)
+}
+
+// DecodeURN returns the kind of the external service and its ID.
+func DecodeURN(urn string) (kind string, id int64) {
+	fields := strings.Split(urn, ":")
+	if len(fields) != 3 {
+		return "", 0
+	}
+
+	id, err := strconv.ParseInt(fields[2], 10, 64)
+	if err != nil {
+		return "", 0
+	}
+	return fields[1], id
+}
+
+type OtherRepoMetadata struct {
+	// RelativePath is relative to ServiceID which is usually the host URL.
+	// Joining them gives you the clone url.
+	RelativePath string
+}
+
+// UniqueCodeHostIdentifier returns a string that uniquely identifies the
+// instance of a code host an external service is pointing at.
+//
+// E.g.: multiple external service configurations might point at the same
+// GitHub Enterprise instance. All of them would return the normalized base URL
+// as a unique identifier.
+//
+// In case an external service doesn't have a base URL (e.g. AWS Code Commit)
+// another unique identifier is returned.
+//
+// This function can be used to group external services by the code host
+// instance they point at.
+func UniqueCodeHostIdentifier(kind, config string) (string, error) {
+	cfg, err := ParseConfig(kind, config)
+	if err != nil {
+		return "", err
+	}
+
+	var rawURL string
+	switch c := cfg.(type) {
+	case *schema.GitLabConnection:
+		rawURL = c.Url
+	case *schema.GitHubConnection:
+		rawURL = c.Url
+	case *schema.BitbucketServerConnection:
+		rawURL = c.Url
+	case *schema.BitbucketCloudConnection:
+		rawURL = c.Url
+	case *schema.PhabricatorConnection:
+		rawURL = c.Url
+	case *schema.OtherExternalServiceConnection:
+		rawURL = c.Url
+	case *schema.GitoliteConnection:
+		rawURL = c.Host
+	case *schema.AWSCodeCommitConnection:
+		// AWS Code Commit does not have a URL in the config, so we return a
+		// unique string here and return early:
+		return c.Region + ":" + c.AccessKeyID, nil
+	case *schema.PerforceConnection:
+		// Perforce uses the P4PORT to specify the instance, so we use that
+		return c.P4Port, nil
+	case *schema.JVMPackagesConnection:
+		return KindJVMPackages, nil
+	default:
+		return "", errors.Errorf("unknown external service kind: %s", kind)
+	}
+
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", err
+	}
+
+	return NormalizeBaseURL(u).String(), nil
 }

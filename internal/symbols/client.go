@@ -5,23 +5,23 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"strings"
 	"sync"
 
+	"github.com/cockroachdb/errors"
 	"github.com/neelance/parallel"
 	"github.com/opentracing-contrib/go-stdlib/nethttp"
 	"github.com/opentracing/opentracing-go/ext"
 	otlog "github.com/opentracing/opentracing-go/log"
-	"github.com/pkg/errors"
+	"golang.org/x/net/context/ctxhttp"
+
 	"github.com/sourcegraph/sourcegraph/internal/api"
 	"github.com/sourcegraph/sourcegraph/internal/endpoint"
 	"github.com/sourcegraph/sourcegraph/internal/env"
 	"github.com/sourcegraph/sourcegraph/internal/search"
-	"github.com/sourcegraph/sourcegraph/internal/symbols/protocol"
+	"github.com/sourcegraph/sourcegraph/internal/search/result"
 	"github.com/sourcegraph/sourcegraph/internal/trace/ot"
-	"golang.org/x/net/context/ctxhttp"
 )
 
 var symbolsURL = env.Get("SYMBOLS_URL", "k8s+http://symbols:3184", "symbols service URL")
@@ -74,7 +74,7 @@ func (c *Client) url(key key) (string, error) {
 }
 
 // Search performs a symbol search on the symbols service.
-func (c *Client) Search(ctx context.Context, args search.SymbolsParameters) (result *protocol.SearchResult, err error) {
+func (c *Client) Search(ctx context.Context, args search.SymbolsParameters) (result *result.Symbols, err error) {
 	span, ctx := ot.StartSpanFromContext(ctx, "symbols.Client.Search")
 	defer func() {
 		if err != nil {
@@ -94,7 +94,7 @@ func (c *Client) Search(ctx context.Context, args search.SymbolsParameters) (res
 
 	if resp.StatusCode != http.StatusOK {
 		// best-effort inclusion of body in error message
-		body, _ := ioutil.ReadAll(io.LimitReader(resp.Body, 200))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
 		return nil, errors.Errorf("Symbol.Search http status %d for %+v: %s", resp.StatusCode, resp.StatusCode, string(body))
 	}
 

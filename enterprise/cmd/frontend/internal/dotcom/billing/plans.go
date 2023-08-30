@@ -2,11 +2,12 @@ package billing
 
 import (
 	"context"
-	"fmt"
 
-	"github.com/sourcegraph/sourcegraph/enterprise/internal/license"
+	"github.com/cockroachdb/errors"
 	"github.com/stripe/stripe-go"
 	"github.com/stripe/stripe-go/plan"
+
+	"github.com/sourcegraph/sourcegraph/enterprise/internal/license"
 )
 
 // InfoForProductPlan returns the license key tags and min/max quantities that should be used for
@@ -27,7 +28,7 @@ func InfoForProductPlan(ctx context.Context, planID string) (licenseTags []strin
 	case plan.Product.Metadata["licenseTags"] != "":
 		tags = license.ParseTagsInput(plan.Product.Metadata["licenseTags"])
 	default:
-		return nil, nil, nil, fmt.Errorf("unable to determine license tags for plan %q (nickname %q)", planID, plan.Nickname)
+		return nil, nil, nil, errors.Errorf("unable to determine license tags for plan %q (nickname %q)", planID, plan.Nickname)
 	}
 
 	minQuantity, maxQuantity = ProductPlanMinMaxQuantity(plan)

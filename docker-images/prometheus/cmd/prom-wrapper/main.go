@@ -1,10 +1,11 @@
-// Command grafana-wrapper provides a wrapper command for Grafana that
-// also handles Sourcegraph configuration changes and making changes to Grafana.
+// Command prom-wrapper provides a wrapper command for Prometheus that
+// also handles Sourcegraph configuration changes and making changes to Prometheus.
+//
+// See https://docs.sourcegraph.com/dev/background-information/observability/prometheus
 package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httputil"
@@ -13,11 +14,15 @@ import (
 	"os/signal"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/gorilla/mux"
 	"github.com/inconshreveable/log15"
-
 	amclient "github.com/prometheus/alertmanager/api/v2/client"
+	prometheusAPI "github.com/prometheus/client_golang/api"
+	prometheus "github.com/prometheus/client_golang/api/prometheus/v1"
+
 	"github.com/sourcegraph/sourcegraph/internal/env"
+	srcprometheus "github.com/sourcegraph/sourcegraph/internal/src-prometheus"
 )
 
 // prom-wrapper configuration options
@@ -28,8 +33,11 @@ var (
 
 	prometheusPort = env.Get("PROMETHEUS_INTERNAL_PORT", "9092", "internal Prometheus port")
 
-	alertmanagerPort       = env.Get("ALERTMANAGER_INTERNAL_PORT", "9093", "internal Alertmanager port")
-	alertmanagerConfigPath = env.Get("ALERTMANAGER_CONFIG_PATH", "/sg_config_prometheus/alertmanager.yml", "alertmanager configuration")
+	alertmanagerPort          = env.Get("ALERTMANAGER_INTERNAL_PORT", "9093", "internal Alertmanager port")
+	alertmanagerConfigPath    = env.Get("ALERTMANAGER_CONFIG_PATH", "/sg_config_prometheus/alertmanager.yml", "path to alertmanager configuration")
+	alertmanagerEnableCluster = env.Get("ALERTMANAGER_ENABLE_CLUSTER", "false", "enable alertmanager clustering")
+
+	opsGenieAPIKey = os.Getenv("OPSGENIE_API_KEY")
 )
 
 func main() {
@@ -50,6 +58,23 @@ func main() {
 	// this includes any endpoints from `siteConfigSubscriber`, reverse-proxying services, etc.
 	router := mux.NewRouter()
 
+	// alertmanager client
+	alertmanager := amclient.NewHTTPClientWithConfig(nil, &amclient.TransportConfig{
+		Host:     fmt.Sprintf("127.0.0.1:%s", alertmanagerPort),
+		BasePath: fmt.Sprintf("/%s/api/v2", alertmanagerPathPrefix),
+		Schemes:  []string{"http"},
+	})
+
+	// prometheus client
+	promClient, err := prometheusAPI.NewClient(prometheusAPI.Config{
+		Address: fmt.Sprintf("http://127.0.0.1:%s", prometheusPort),
+	})
+	if err != nil {
+		log.Crit("failed to initialize prometheus client",
+			"error", err)
+		os.Exit(1)
+	}
+
 	// disable all components that depend on Alertmanager if DISABLE_ALERTMANAGER=true
 	if disableAlertmanager {
 		log.Warn("DISABLE_ALERTMANAGER=true; Alertmanager is disabled")
@@ -59,11 +84,6 @@ func main() {
 
 		// wait for alertmanager to become available
 		log.Info("waiting for alertmanager")
-		alertmanager := amclient.NewHTTPClientWithConfig(nil, &amclient.TransportConfig{
-			Host:     fmt.Sprintf("127.0.0.1:%s", alertmanagerPort),
-			BasePath: fmt.Sprintf("/%s/api/v2", alertmanagerPathPrefix),
-			Schemes:  []string{"http"},
-		})
 		alertmanagerWaitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		if err := waitForAlertmanager(alertmanagerWaitCtx, alertmanager); err != nil {
 			log.Crit("unable to reach Alertmanager", "error", err)
@@ -83,11 +103,8 @@ func main() {
 			go subscriber.Subscribe(ctx)
 
 			// serve subscriber status
-			router.PathPrefix("/prom-wrapper/config-subscriber").Handler(subscriber.Handler())
+			router.PathPrefix(srcprometheus.EndpointConfigSubscriber).Handler(subscriber.Handler())
 		}
-
-		// serve alerts summary status
-		router.PathPrefix("/prom-wrapper/alerts-status").Handler(NewAlertsStatusReporter(log, alertmanager).Handler())
 
 		// serve alertmanager via reverse proxy
 		router.PathPrefix(fmt.Sprintf("/%s", alertmanagerPathPrefix)).Handler(&httputil.ReverseProxy{
@@ -97,6 +114,10 @@ func main() {
 			},
 		})
 	}
+
+	// serve alerts summary status
+	alertsReporter := NewAlertsStatusReporter(log, alertmanager, prometheus.NewAPI(promClient))
+	router.PathPrefix(srcprometheus.EndpointAlertsStatus).Handler(alertsReporter.Handler())
 
 	// serve prometheus by default via reverse proxy - place last so other prefixes get served first
 	router.PathPrefix("/").Handler(&httputil.ReverseProxy{
@@ -125,9 +146,9 @@ func main() {
 		exitCode = 2
 	case err := <-procErrs:
 		if err != nil {
-			var exitErr *exec.ExitError
-			if errors.As(err, &exitErr) {
-				exitCode = exitErr.ProcessState.ExitCode()
+			var e *exec.ExitError
+			if errors.As(err, &e) {
+				exitCode = e.ProcessState.ExitCode()
 			} else {
 				exitCode = 1
 			}

@@ -4,13 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/require"
+
 	"github.com/sourcegraph/sourcegraph/cmd/searcher/protocol"
 	"github.com/sourcegraph/sourcegraph/internal/comby"
+	"github.com/sourcegraph/sourcegraph/internal/search"
 	"github.com/sourcegraph/sourcegraph/internal/testutil"
 )
 
@@ -25,11 +30,6 @@ func TestMatcherLookupByLanguage(t *testing.T) {
 /* This foo(plain string) {} is in a Go comment should not match in Go, but should match in plaintext */
 func foo(go string) {}
 `,
-	}
-
-	p := &protocol.PatternInfo{
-		Pattern:         "foo(:[args])",
-		IncludePatterns: []string{"file_without_extension"},
 	}
 
 	cases := []struct {
@@ -64,25 +64,134 @@ func foo(go string) {}
 	}
 	defer cleanup()
 
-	for _, tt := range cases {
-		t.Run(tt.Name, func(t *testing.T) {
-			p.Languages = tt.Languages
-			matches, _, err := structuralSearch(context.Background(), zf, p.Pattern, p.CombyRule, p.Languages, p.IncludePatterns, "repo_foo")
-			if err != nil {
-				t.Fatal(err)
-			}
-			var got []string
-			for _, fileMatches := range matches {
-				for _, m := range fileMatches.LineMatches {
-					got = append(got, m.Preview)
-				}
-			}
+	t.Run("group", func(t *testing.T) {
+		for _, tt := range cases {
+			tt := tt
+			t.Run(tt.Name, func(t *testing.T) {
+				t.Parallel()
 
-			if !reflect.DeepEqual(got, tt.Want) {
-				t.Fatalf("got file matches %v, want %v", got, tt.Want)
-			}
-		})
+				p := &protocol.PatternInfo{
+					Pattern:         "foo(:[args])",
+					IncludePatterns: []string{"file_without_extension"},
+					Languages:       tt.Languages,
+				}
+
+				ctx, cancel, sender := newLimitedStreamCollector(context.Background(), 100000000)
+				defer cancel()
+				err := structuralSearch(ctx, zf, Subset(p.IncludePatterns), "", p.Pattern, p.CombyRule, p.Languages, "repo_foo", sender)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var got []string
+				for _, fileMatches := range sender.collected {
+					for _, m := range fileMatches.LineMatches {
+						got = append(got, m.Preview)
+					}
+				}
+
+				if !reflect.DeepEqual(got, tt.Want) {
+					t.Fatalf("got file matches %v, want %v", got, tt.Want)
+				}
+			})
+		}
+	})
+}
+
+func TestMatcherLookupByExtension(t *testing.T) {
+	// If we are not on CI skip the test.
+	if os.Getenv("CI") == "" {
+		t.Skip("Not on CI, skipping comby-dependent test")
 	}
+
+	t.Parallel()
+
+	input := map[string]string{
+		"file_without_extension": `
+/* This foo(plain.empty) {} is in a Go comment should not match in Go, but should match in plaintext */
+func foo(go.empty) {}
+`,
+		"file.go": `
+/* This foo(plain.go) {} is in a Go comment should not match in Go, but should match in plaintext */
+func foo(go.go) {}
+`,
+		"file.txt": `
+/* This foo(plain.txt) {} is in a Go comment should not match in Go, but should match in plaintext */
+func foo(go.txt) {}
+`,
+	}
+
+	zipData, err := testutil.CreateZip(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zf, cleanup, err := testutil.TempZipFileOnDisk(zipData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	test := func(language, filename string) string {
+		var languages []string
+		if language != "" {
+			languages = []string{language}
+		}
+
+		extensionHint := filepath.Ext(filename)
+		ctx, cancel, sender := newLimitedStreamCollector(context.Background(), 1000000000)
+		defer cancel()
+		err := structuralSearch(ctx, zf, All, extensionHint, "foo(:[args])", "", languages, "repo_foo", sender)
+		if err != nil {
+			return "ERROR: " + err.Error()
+		}
+		var got []string
+		for _, fileMatches := range sender.collected {
+			for _, m := range fileMatches.LineMatches {
+				got = append(got, m.Preview)
+			}
+		}
+		sort.Strings(got)
+		return strings.Join(got, " ")
+	}
+
+	cases := []struct {
+		name     string
+		want     string
+		language string
+		filename string
+	}{{
+		name:     "No language and no file extension => .generic matcher",
+		want:     "foo(go.empty) foo(go.go) foo(go.txt) foo(plain.empty) foo(plain.go) foo(plain.txt)",
+		language: "",
+		filename: "file_without_extension",
+	}, {
+		name:     "No language and .go file extension => .go matcher",
+		want:     "foo(go.empty) foo(go.go) foo(go.txt)",
+		language: "",
+		filename: "a/b/c/file.go",
+	}, {
+		name:     "Language Go and no file extension => .go matcher",
+		want:     "foo(go.empty) foo(go.go) foo(go.txt)",
+		language: "go",
+		filename: "",
+	}, {
+		name:     "Language .go and .txt file extension => .go matcher",
+		want:     "foo(go.empty) foo(go.go) foo(go.txt)",
+		language: "go",
+		filename: "file.txt",
+	}}
+	t.Run("group", func(t *testing.T) {
+		for _, tc := range cases {
+			tc := tc
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				got := test(tc.language, tc.filename)
+				if d := cmp.Diff(tc.want, got); d != "" {
+					t.Errorf("mismatch (-want +got):\n%s", d)
+				}
+			})
+		}
+	})
 }
 
 // Tests that structural search correctly infers the Go matcher from the .go
@@ -103,27 +212,32 @@ func foo(real string) {}
 	pattern := "foo(:[args])"
 	want := "foo(real string)"
 
-	includePatterns := []string{"main.go"}
-
 	zipData, err := testutil.CreateZip(input)
 	if err != nil {
 		t.Fatal(err)
 	}
-	zf, cleanup, err := testutil.TempZipFileOnDisk(zipData)
+	zPath, cleanup, err := testutil.TempZipFileOnDisk(zipData)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer cleanup()
 
-	p := &protocol.PatternInfo{
-		Pattern:         pattern,
-		IncludePatterns: includePatterns,
-	}
-	m, _, err := structuralSearch(context.Background(), zf, p.Pattern, p.CombyRule, p.Languages, p.IncludePatterns, "foo")
+	zFile, _ := testutil.MockZipFile(zipData)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := m[0].LineMatches[0].Preview
+
+	p := &protocol.PatternInfo{
+		Pattern: pattern,
+		Limit:   30,
+	}
+	ctx, cancel, sender := newLimitedStreamCollector(context.Background(), 1000000000)
+	defer cancel()
+	err = filteredStructuralSearch(ctx, zPath, zFile, p, "foo", sender)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := sender.collected[0].LineMatches[0].Preview
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,39 +250,44 @@ func foo(real string) {}
 func TestRecordMetrics(t *testing.T) {
 	cases := []struct {
 		name            string
-		matcher         string
-		includePatterns *[]string
+		language        []string
+		includePatterns []string
 		want            string
 	}{
 		{
 			name:            "Empty values",
-			matcher:         "",
-			includePatterns: &[]string{},
-			want:            "inferred:.generic",
+			language:        nil,
+			includePatterns: []string{},
+			want:            ".generic",
 		},
 		{
 			name:            "Include patterns no extension",
-			matcher:         "",
-			includePatterns: &[]string{"foo", "bar.go"},
-			want:            "inferred:.generic",
+			language:        nil,
+			includePatterns: []string{"foo", "bar.go"},
+			want:            ".generic",
 		},
 		{
 			name:            "Include patterns first extension",
-			matcher:         "",
-			includePatterns: &[]string{"foo.c", "bar.go"},
-			want:            "inferred:.c",
+			language:        nil,
+			includePatterns: []string{"foo.c", "bar.go"},
+			want:            ".c",
 		},
 		{
-			name:            "Non-empty matcher",
-			matcher:         ".xml",
-			includePatterns: &[]string{"foo.c", "bar.go"},
+			name:            "Non-empty language",
+			language:        []string{"xml"},
+			includePatterns: []string{"foo.c", "bar.go"},
 			want:            ".xml",
 		},
 	}
 
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			got := languageMetric(tt.matcher, tt.includePatterns)
+			var extensionHint string
+			if len(tt.includePatterns) > 0 {
+				filename := tt.includePatterns[0]
+				extensionHint = filepath.Ext(filename)
+			}
+			got := toMatcher(tt.language, extensionHint)
 			if diff := cmp.Diff(tt.want, got); diff != "" {
 				t.Fatal(diff)
 			}
@@ -219,10 +338,13 @@ func TestIncludePatterns(t *testing.T) {
 		Pattern:         "",
 		IncludePatterns: includePatterns,
 	}
-	fileMatches, _, err := structuralSearch(context.Background(), zf, p.Pattern, p.CombyRule, p.Languages, p.IncludePatterns, "foo")
+	ctx, cancel, sender := newLimitedStreamCollector(context.Background(), 1000000000)
+	defer cancel()
+	err = structuralSearch(ctx, zf, Subset(p.IncludePatterns), "", p.Pattern, p.CombyRule, p.Languages, "foo", sender)
 	if err != nil {
 		t.Fatal(err)
 	}
+	fileMatches := sender.collected
 
 	got := make([]string, len(fileMatches))
 	for i, fm := range fileMatches {
@@ -260,10 +382,13 @@ func TestRule(t *testing.T) {
 		CombyRule:       `where :[args] == "success"`,
 	}
 
-	got, _, err := structuralSearch(context.Background(), zf, p.Pattern, p.CombyRule, p.Languages, p.IncludePatterns, "repo")
+	ctx, cancel, sender := newLimitedStreamCollector(context.Background(), 1000000000)
+	defer cancel()
+	err = structuralSearch(ctx, zf, Subset(p.IncludePatterns), "", p.Pattern, p.CombyRule, p.Languages, "repo", sender)
 	if err != nil {
 		t.Fatal(err)
 	}
+	got := sender.collected
 
 	want := []protocol.FileMatch{
 		{
@@ -283,7 +408,65 @@ func TestRule(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got file matches %v, want %v", got, want)
 	}
+}
 
+func TestStructuralLimits(t *testing.T) {
+	// If we are not on CI skip the test.
+	if os.Getenv("CI") == "" {
+		t.Skip("Not on CI, skipping comby-dependent test")
+	}
+
+	input := map[string]string{
+		"test1.go": `
+func foo() {
+    fmt.Println("foo")
+}
+
+func bar() {
+    fmt.Println("bar")
+}
+`,
+		"test2.go": `
+func foo() {
+    fmt.Println("foo")
+}
+
+func bar() {
+    fmt.Println("bar")
+}
+`,
+	}
+
+	zipData, err := testutil.CreateZip(input)
+	require.NoError(t, err)
+
+	zf, cleanup, err := testutil.TempZipFileOnDisk(zipData)
+	require.NoError(t, err)
+	defer cleanup()
+
+	count := func(matches []protocol.FileMatch) int {
+		c := 0
+		for _, match := range matches {
+			c += match.MatchCount
+		}
+		return c
+	}
+
+	test := func(limit, wantCount int, p *protocol.PatternInfo) func(t *testing.T) {
+		return func(t *testing.T) {
+			ctx, cancel, sender := newLimitedStreamCollector(context.Background(), limit)
+			defer cancel()
+			err := structuralSearch(ctx, zf, Subset(p.IncludePatterns), "", p.Pattern, p.CombyRule, p.Languages, "repo_foo", sender)
+			require.NoError(t, err)
+
+			require.Equal(t, wantCount, count(sender.collected))
+		}
+	}
+
+	t.Run("unlimited", test(10000, 4, &protocol.PatternInfo{Pattern: "{:[body]}"}))
+	t.Run("exact limit", test(4, 4, &protocol.PatternInfo{Pattern: "{:[body]}"}))
+	t.Run("limited", test(2, 2, &protocol.PatternInfo{Pattern: "{:[body]}"}))
+	t.Run("many", test(12, 8, &protocol.PatternInfo{Pattern: "(:[_])"}))
 }
 
 func TestHighlightMultipleLines(t *testing.T) {
@@ -414,16 +597,30 @@ func bar() {
 	defer cleanup()
 
 	t.Run("Strutural search match count", func(t *testing.T) {
-		matches, _, err := structuralSearch(context.Background(), zf, p.Pattern, p.CombyRule, p.Languages, p.IncludePatterns, "repo_foo")
+		ctx, cancel, sender := newLimitedStreamCollector(context.Background(), 1000000000)
+		defer cancel()
+		err := structuralSearch(ctx, zf, Subset(p.IncludePatterns), "", p.Pattern, p.CombyRule, p.Languages, "repo_foo", sender)
 		if err != nil {
 			t.Fatal(err)
 		}
+		matches := sender.collected
 		var gotMatchCount int
 		for _, fileMatches := range matches {
 			gotMatchCount += fileMatches.MatchCount
 		}
 		if gotMatchCount != wantMatchCount {
 			t.Fatalf("got match count %d, want %d", gotMatchCount, wantMatchCount)
+		}
+	})
+}
+
+func TestBuildQuery(t *testing.T) {
+	pattern := ":[x~*]"
+	want := "error parsing regexp: missing argument to repetition operator: `*`"
+	t.Run("build query", func(t *testing.T) {
+		_, err := buildQuery(&search.TextPatternInfo{Pattern: pattern}, nil, nil, false)
+		if diff := cmp.Diff(err.Error(), want); diff != "" {
+			t.Error(diff)
 		}
 	})
 }

@@ -4,22 +4,24 @@ import (
 	"context"
 	"testing"
 
-	"github.com/graph-gophers/graphql-go/gqltesting"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/types"
 	"github.com/sourcegraph/sourcegraph/internal/actor"
 	"github.com/sourcegraph/sourcegraph/internal/api"
-	"github.com/sourcegraph/sourcegraph/internal/db"
+	"github.com/sourcegraph/sourcegraph/internal/database"
+	"github.com/sourcegraph/sourcegraph/internal/types"
 )
 
 func TestSettingsMutation_EditSettings(t *testing.T) {
 	resetMocks()
-	db.Mocks.Users.GetByID = func(context.Context, int32) (*types.User, error) {
+	database.Mocks.Users.GetByID = func(context.Context, int32) (*types.User, error) {
 		return &types.User{ID: 1}, nil
 	}
-	db.Mocks.Settings.GetLatest = func(context.Context, api.SettingsSubject) (*api.Settings, error) {
+	database.Mocks.Users.GetByCurrentAuthUser = func(ctx context.Context) (*types.User, error) {
+		return &types.User{ID: 1, SiteAdmin: false}, nil
+	}
+	database.Mocks.Settings.GetLatest = func(context.Context, api.SettingsSubject) (*api.Settings, error) {
 		return &api.Settings{ID: 1, Contents: "{}"}, nil
 	}
-	db.Mocks.Settings.CreateIfUpToDate = func(ctx context.Context, subject api.SettingsSubject, lastID, authorUserID *int32, contents string) (*api.Settings, error) {
+	database.Mocks.Settings.CreateIfUpToDate = func(ctx context.Context, subject api.SettingsSubject, lastID, authorUserID *int32, contents string) (*api.Settings, error) {
 		if want := `{
   "p": {
     "x": 123
@@ -30,7 +32,7 @@ func TestSettingsMutation_EditSettings(t *testing.T) {
 		return &api.Settings{ID: 2, Contents: contents}, nil
 	}
 
-	gqltesting.RunTests(t, []*gqltesting.Test{
+	RunTests(t, []*Test{
 		{
 			Context: actor.WithActor(context.Background(), &actor.Actor{UID: 1}),
 			Schema:  mustParseGraphQLSchema(t),
@@ -61,20 +63,23 @@ func TestSettingsMutation_EditSettings(t *testing.T) {
 
 func TestSettingsMutation_OverwriteSettings(t *testing.T) {
 	resetMocks()
-	db.Mocks.Users.GetByID = func(context.Context, int32) (*types.User, error) {
+	database.Mocks.Users.GetByID = func(context.Context, int32) (*types.User, error) {
 		return &types.User{ID: 1}, nil
 	}
-	db.Mocks.Settings.GetLatest = func(context.Context, api.SettingsSubject) (*api.Settings, error) {
+	database.Mocks.Users.GetByCurrentAuthUser = func(ctx context.Context) (*types.User, error) {
+		return &types.User{ID: 1, SiteAdmin: false}, nil
+	}
+	database.Mocks.Settings.GetLatest = func(context.Context, api.SettingsSubject) (*api.Settings, error) {
 		return &api.Settings{ID: 1, Contents: "{}"}, nil
 	}
-	db.Mocks.Settings.CreateIfUpToDate = func(ctx context.Context, subject api.SettingsSubject, lastID, authorUserID *int32, contents string) (*api.Settings, error) {
+	database.Mocks.Settings.CreateIfUpToDate = func(ctx context.Context, subject api.SettingsSubject, lastID, authorUserID *int32, contents string) (*api.Settings, error) {
 		if want := `x`; contents != want {
 			t.Errorf("got %q, want %q", contents, want)
 		}
 		return &api.Settings{ID: 2, Contents: contents}, nil
 	}
 
-	gqltesting.RunTests(t, []*gqltesting.Test{
+	RunTests(t, []*Test{
 		{
 			Context: actor.WithActor(context.Background(), &actor.Actor{UID: 1}),
 			Schema:  mustParseGraphQLSchema(t),

@@ -7,12 +7,14 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/go-openapi/strfmt"
 	"github.com/inconshreveable/log15"
 	amclient "github.com/prometheus/alertmanager/api/v2/client"
 	"github.com/prometheus/alertmanager/api/v2/client/silence"
 	"github.com/prometheus/alertmanager/api/v2/models"
 	amconfig "github.com/prometheus/alertmanager/config"
+
 	"github.com/sourcegraph/sourcegraph/internal/conf"
 	"github.com/sourcegraph/sourcegraph/schema"
 )
@@ -37,44 +39,10 @@ func changeReceivers(ctx context.Context, log log15.Logger, change ChangeContext
 		result.Problems = append(result.Problems, conf.NewSiteProblem(fmt.Sprintf("`observability.alerts`: %v", err)))
 	}
 
-	// generate new notifiers configuration
-	change.AMConfig.Receivers = append(newReceivers(newConfig.Alerts, newProblem), &amconfig.Receiver{
-		// stub receiver
-		Name: alertmanagerNoopReceiver,
-	})
-
-	// make sure alerts are routed appropriately
-	change.AMConfig.Route = &amconfig.Route{
-		Receiver: alertmanagerNoopReceiver,
-		// include `alertname` for now to accommodate non-generator alerts - in the long run, we want to remove grouping on `alertname`
-		// because all alerts should have some predefined labels
-		// https://github.com/sourcegraph/sourcegraph/issues/5370
-		GroupByStr: []string{"alertname", "level", "service_name", "name"},
-
-		// How long to initially wait to send a notification for a group - each group matches exactly one alert, so fire immediately
-		GroupWait: duration(1 * time.Second),
-
-		// How long to wait before sending a notification about new alerts that are added to a group of alerts - in this case,
-		// equivalent to how long to wait until notifying about an alert re-firing
-		GroupInterval:  duration(1 * time.Minute),
-		RepeatInterval: duration(48 * time.Hour),
-
-		// Route alerts to notifications
-		Routes: []*amconfig.Route{
-			{
-				Receiver: alertmanagerWarningReceiver,
-				Match: map[string]string{
-					"level": "warning",
-				},
-			},
-			{
-				Receiver: alertmanagerCriticalReceiver,
-				Match: map[string]string{
-					"level": "critical",
-				},
-			},
-		},
-	}
+	// reset and generate new alertmanager receivers and routes configuration
+	receivers, routes := newRoutesAndReceivers(newConfig.Alerts, newConfig.ExternalURL, newProblem)
+	change.AMConfig.Receivers = receivers
+	change.AMConfig.Route = newRootRoute(routes)
 
 	return result
 }
@@ -134,7 +102,7 @@ func changeSilences(ctx context.Context, log log15.Logger, change ChangeContext,
 	// delete existing silences that should no longer be silenced
 	existingSilences, err := change.AMClient.Silence.GetSilences(&silence.GetSilencesParams{Context: ctx})
 	if err != nil {
-		newProblem(fmt.Errorf("failed to get existing silences: %w", err))
+		newProblem(errors.Errorf("failed to get existing silences: %w", err))
 		return
 	}
 	for _, s := range existingSilences.Payload {
@@ -152,7 +120,7 @@ func changeSilences(ctx context.Context, log log15.Logger, change ChangeContext,
 				Context:   ctx,
 				SilenceID: uid,
 			}); err != nil {
-				newProblem(fmt.Errorf("failed to delete existing silence %q: %w", *s.ID, err))
+				newProblem(errors.Errorf("failed to delete existing silence %q: %w", *s.ID, err))
 				return
 			}
 		}
@@ -188,7 +156,7 @@ func changeSilences(ctx context.Context, log log15.Logger, change ChangeContext,
 		if err != nil {
 			silenceData, _ := json.Marshal(s)
 			log.Error("failed to update silence", "error", err, "silence", string(silenceData), "existingSilence", existingSilence)
-			newProblem(fmt.Errorf("failed to update silence: %w", err))
+			newProblem(errors.Errorf("failed to update silence: %w", err))
 			return
 		}
 	}

@@ -1,0 +1,21 @@
+// Jest Snapshot v1, https://goo.gl/fbAQLP
+
+exports[`RepoFileLink renders 1`] = `
+<div>
+  <a
+    href="https://example.com"
+  >
+    my/repo
+  </a>
+   ›
+   
+  <a
+    href="/file?subtree=true"
+  >
+    my/
+    <strong>
+      file
+    </strong>
+  </a>
+</div>
+`;

@@ -9,9 +9,11 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	aws_ext "github.com/aws/aws-sdk-go-v2/aws/external"
+	aws_cfg "github.com/aws/aws-sdk-go-v2/config"
 	aws_ec2 "github.com/aws/aws-sdk-go-v2/service/ec2"
+	aws_ec2_types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	aws_eks "github.com/aws/aws-sdk-go-v2/service/eks"
+	"github.com/cockroachdb/errors"
 )
 
 // for resources that require enumerating over regions, it is not very practical to
@@ -35,11 +37,13 @@ var awsResources = map[string]AWSResourceFetchFunc{
 			return nil
 		}
 
-		client := aws_ec2.New(cfg)
-
-		instancesPager := aws_ec2.NewDescribeInstancesPaginator(client.DescribeInstancesRequest(&aws_ec2.DescribeInstancesInput{}))
-		for instancesPager.Next(ctx) {
-			page := instancesPager.CurrentPage()
+		client := aws_ec2.NewFromConfig(cfg)
+		instancesPager := aws_ec2.NewDescribeInstancesPaginator(client, &aws_ec2.DescribeInstancesInput{})
+		for instancesPager.HasMorePages() {
+			page, err := instancesPager.NextPage(ctx)
+			if err != nil {
+				return errors.Errorf("failed to fetch page: %w", err)
+			}
 			for _, reservation := range page.Reservations {
 				for _, instance := range reservation.Instances {
 					if instance.LaunchTime.After(since) {
@@ -58,13 +62,13 @@ var awsResources = map[string]AWSResourceFetchFunc{
 				}
 			}
 		}
-		if instancesPager.Err() != nil {
-			return fmt.Errorf("instances query failed: %w", instancesPager.Err())
-		}
 
-		volumesPager := aws_ec2.NewDescribeVolumesPaginator(client.DescribeVolumesRequest(&aws_ec2.DescribeVolumesInput{}))
-		for volumesPager.Next(ctx) {
-			page := volumesPager.CurrentPage()
+		volumesPager := aws_ec2.NewDescribeVolumesPaginator(client, &aws_ec2.DescribeVolumesInput{})
+		for volumesPager.HasMorePages() {
+			page, err := volumesPager.NextPage(ctx)
+			if err != nil {
+				return errors.Errorf("failed to fetch page: %w", err)
+			}
 			for _, volume := range page.Volumes {
 				if volume.CreateTime.After(since) {
 					results <- Resource{
@@ -82,9 +86,6 @@ var awsResources = map[string]AWSResourceFetchFunc{
 				}
 			}
 		}
-		if volumesPager.Err() != nil {
-			return fmt.Errorf("volumes query failed: %w", volumesPager.Err())
-		}
 
 		return nil
 	},
@@ -95,16 +96,19 @@ var awsResources = map[string]AWSResourceFetchFunc{
 			return nil
 		}
 
-		client := aws_eks.New(cfg)
-		pager := aws_eks.NewListClustersPaginator(client.ListClustersRequest(&aws_eks.ListClustersInput{}))
-		for pager.Next(ctx) {
-			page := pager.CurrentPage()
+		client := aws_eks.NewFromConfig(cfg)
+		pager := aws_eks.NewListClustersPaginator(client, &aws_eks.ListClustersInput{})
+		for pager.HasMorePages() {
+			page, err := pager.NextPage(ctx)
+			if err != nil {
+				return errors.Errorf("failed to fetch page: %w", err)
+			}
 			for _, clusterName := range page.Clusters {
-				cluster, err := client.DescribeClusterRequest(&aws_eks.DescribeClusterInput{
+				cluster, err := client.DescribeCluster(ctx, &aws_eks.DescribeClusterInput{
 					Name: aws.String(clusterName),
-				}).Send(ctx)
+				})
 				if err != nil {
-					return fmt.Errorf("failed to fetch details for cluster '%s': %w", clusterName, err)
+					return errors.Errorf("failed to fetch details for cluster '%s': %w", clusterName, err)
 				}
 				if cluster.Cluster.CreatedAt.After(since) {
 					results <- Resource{
@@ -121,7 +125,7 @@ var awsResources = map[string]AWSResourceFetchFunc{
 				}
 			}
 		}
-		return pager.Err()
+		return nil
 	},
 }
 
@@ -131,9 +135,9 @@ func collectAWSResources(ctx context.Context, since time.Time, verbose bool, tag
 		logger.Printf("collecting resources since %s", since)
 	}
 
-	cfg, err := aws_ext.LoadDefaultAWSConfig()
+	cfg, err := aws_cfg.LoadDefaultConfig(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to init client: %w", err)
+		return nil, errors.Errorf("failed to init client: %w", err)
 	}
 	cfg.Region = "us-east-1" // set an arbitrary region to start
 
@@ -142,11 +146,11 @@ func collectAWSResources(ctx context.Context, since time.Time, verbose bool, tag
 	wait := &sync.WaitGroup{}
 
 	// iterate over regions based on accessible EC2 regions
-	regions, err := aws_ec2.New(cfg).DescribeRegionsRequest(&aws_ec2.DescribeRegionsInput{
-		AllRegions: aws.Bool(true),
-	}).Send(ctx)
+	regions, err := aws_ec2.NewFromConfig(cfg).DescribeRegions(ctx, &aws_ec2.DescribeRegionsInput{
+		AllRegions: true,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to list regions: %w", err)
+		return nil, errors.Errorf("failed to list regions: %w", err)
 	}
 	for _, region := range regions.Regions {
 		if !hasPrefix(*region.RegionName, awsRegionPrefixes) {
@@ -162,7 +166,7 @@ func collectAWSResources(ctx context.Context, since time.Time, verbose bool, tag
 			wait.Add(1)
 			go func(resourceID string, fetchResource AWSResourceFetchFunc, cfg aws.Config) {
 				if err := fetchResource(ctx, results, cfg, since); err != nil {
-					errs <- fmt.Errorf("region %s, resource %s: %w", cfg.Region, resourceID, err)
+					errs <- errors.Errorf("region %s, resource %s: %w", cfg.Region, resourceID, err)
 				}
 				wait.Done()
 			}(resourceID, fetchResource, cfg.Copy())
@@ -198,7 +202,7 @@ func collectAWSResources(ctx context.Context, since time.Time, verbose bool, tag
 	}
 }
 
-func ec2TagsToMap(tags []aws_ec2.Tag) map[string]string {
+func ec2TagsToMap(tags []aws_ec2_types.Tag) map[string]string {
 	m := map[string]string{}
 	for _, tag := range tags {
 		m[*tag.Key] = *tag.Value

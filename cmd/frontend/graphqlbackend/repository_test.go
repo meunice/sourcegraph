@@ -2,16 +2,21 @@ package graphqlbackend
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"testing"
 
-	"github.com/graph-gophers/graphql-go/gqltesting"
+	"github.com/cockroachdb/errors"
+	"github.com/hexops/autogold"
+
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/backend"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/types"
 	"github.com/sourcegraph/sourcegraph/internal/api"
-	"github.com/sourcegraph/sourcegraph/internal/db"
+	"github.com/sourcegraph/sourcegraph/internal/database"
+	"github.com/sourcegraph/sourcegraph/internal/database/dbtesting"
 	"github.com/sourcegraph/sourcegraph/internal/extsvc"
+	"github.com/sourcegraph/sourcegraph/internal/gitserver"
+	"github.com/sourcegraph/sourcegraph/internal/search/result"
+	"github.com/sourcegraph/sourcegraph/internal/types"
+	"github.com/sourcegraph/sourcegraph/internal/vcs"
 	"github.com/sourcegraph/sourcegraph/internal/vcs/git"
 )
 
@@ -19,7 +24,7 @@ const exampleCommitSHA1 = "1234567890123456789012345678901234567890"
 
 func TestRepository_Commit(t *testing.T) {
 	resetMocks()
-	db.Mocks.Repos.MockGetByName(t, "github.com/gorilla/mux", 2)
+	database.Mocks.Repos.MockGetByName(t, "github.com/gorilla/mux", 2)
 	backend.Mocks.Repos.ResolveRev = func(ctx context.Context, repo *types.Repo, rev string) (api.CommitID, error) {
 		if repo.ID != 2 || rev != "abc" {
 			t.Error("wrong arguments to ResolveRev")
@@ -28,7 +33,7 @@ func TestRepository_Commit(t *testing.T) {
 	}
 	backend.Mocks.Repos.MockGetCommit_Return_NoCheck(t, &git.Commit{ID: exampleCommitSHA1})
 
-	gqltesting.RunTests(t, []*gqltesting.Test{
+	RunTests(t, []*Test{
 		{
 			Schema: mustParseGraphQLSchema(t),
 			Query: `
@@ -54,6 +59,7 @@ func TestRepository_Commit(t *testing.T) {
 }
 
 func TestRepositoryHydration(t *testing.T) {
+	db := new(dbtesting.MockDB)
 	makeRepos := func() (*types.Repo, *types.Repo) {
 		const id = 42
 		name := fmt.Sprintf("repo-%d", id)
@@ -61,20 +67,17 @@ func TestRepositoryHydration(t *testing.T) {
 		minimal := types.Repo{
 			ID:   api.RepoID(id),
 			Name: api.RepoName(name),
-			ExternalRepo: api.ExternalRepoSpec{
-				ID:          name,
-				ServiceType: extsvc.TypeGitHub,
-				ServiceID:   "https://github.com",
-			},
 		}
 
 		hydrated := minimal
-		hydrated.RepoFields = &types.RepoFields{
-			URI:         fmt.Sprintf("github.com/foobar/%s", name),
-			Description: "This is a description of a repository",
-			Language:    "monkey",
-			Fork:        false,
+		hydrated.ExternalRepo = api.ExternalRepoSpec{
+			ID:          name,
+			ServiceType: extsvc.TypeGitHub,
+			ServiceID:   "https://github.com",
 		}
+		hydrated.URI = fmt.Sprintf("github.com/foobar/%s", name)
+		hydrated.Description = "This is a description of a repository"
+		hydrated.Fork = false
 
 		return &minimal, &hydrated
 	}
@@ -83,12 +86,12 @@ func TestRepositoryHydration(t *testing.T) {
 
 	t.Run("hydrated without errors", func(t *testing.T) {
 		minimalRepo, hydratedRepo := makeRepos()
-		db.Mocks.Repos.Get = func(ctx context.Context, id api.RepoID) (*types.Repo, error) {
+		database.Mocks.Repos.Get = func(ctx context.Context, id api.RepoID) (*types.Repo, error) {
 			return hydratedRepo, nil
 		}
-		defer func() { db.Mocks = db.MockStores{} }()
+		defer func() { database.Mocks = database.MockStores{} }()
 
-		repoResolver := &RepositoryResolver{repo: minimalRepo}
+		repoResolver := NewRepositoryResolver(db, minimalRepo)
 		assertRepoResolverHydrated(ctx, t, repoResolver, hydratedRepo)
 	})
 
@@ -97,12 +100,12 @@ func TestRepositoryHydration(t *testing.T) {
 
 		dbErr := errors.New("cannot load repo")
 
-		db.Mocks.Repos.Get = func(ctx context.Context, id api.RepoID) (*types.Repo, error) {
+		database.Mocks.Repos.Get = func(ctx context.Context, id api.RepoID) (*types.Repo, error) {
 			return nil, dbErr
 		}
-		defer func() { db.Mocks = db.MockStores{} }()
+		defer func() { database.Mocks = database.MockStores{} }()
 
-		repoResolver := &RepositoryResolver{repo: minimalRepo}
+		repoResolver := NewRepositoryResolver(db, minimalRepo)
 		_, err := repoResolver.Description(ctx)
 		if err == nil {
 			t.Fatal("err is unexpected nil")
@@ -143,5 +146,97 @@ func assertRepoResolverHydrated(ctx context.Context, t *testing.T, r *Repository
 
 	if uri != hydrated.URI {
 		t.Fatalf("wrong URI. want=%q, have=%q", hydrated.URI, uri)
+	}
+}
+
+func TestRepositoryLabel(t *testing.T) {
+	test := func(name string) string {
+		r := &RepositoryResolver{
+			RepoMatch: result.RepoMatch{
+				Name: api.RepoName(name),
+				ID:   api.RepoID(0),
+			},
+		}
+		result, _ := r.Label()
+		return result.HTML()
+	}
+
+	autogold.Want("encodes spaces for URL in HTML", `<p><a href="/repo%20with%20spaces" rel="nofollow">repo with spaces</a></p>
+`).Equal(t, test("repo with spaces"))
+}
+
+func TestRepository_DefaultBranch(t *testing.T) {
+	ctx := context.Background()
+	ts := []struct {
+		name                string
+		symbolicRef         string
+		symbolicRefExitCode int
+		symbolicRefErr      error
+		resolveRevisionErr  error
+		wantBranch          *GitRefResolver
+		wantErr             error
+	}{
+		{
+			name:        "ref exists",
+			symbolicRef: "refs/heads/main",
+			wantBranch:  &GitRefResolver{name: "refs/heads/main"},
+		},
+		{
+			name:           "clone in progress",
+			symbolicRefErr: &vcs.RepoNotExistError{CloneInProgress: true},
+			// Expect it to not fail and not return a resolver.
+			wantBranch: nil,
+			wantErr:    nil,
+		},
+		{
+			name:                "symbolic ref fails",
+			symbolicRefExitCode: 1,
+			symbolicRefErr:      errors.New("bad git error"),
+			wantErr:             errors.New("bad git error"),
+		},
+		{
+			name:               "default branch doesn't exist",
+			symbolicRef:        "refs/heads/main",
+			resolveRevisionErr: &gitserver.RevisionNotFoundError{Repo: "repo", Spec: "refs/heads/main"},
+			// Expect it to not fail and not return a resolver.
+			wantBranch: nil,
+			wantErr:    nil,
+		},
+	}
+	for _, tt := range ts {
+		t.Run(tt.name, func(t *testing.T) {
+			git.Mocks.ExecSafe = func(params []string) (stdout []byte, stderr []byte, exitCode int, err error) {
+				return []byte(tt.symbolicRef), nil, tt.symbolicRefExitCode, tt.symbolicRefErr
+			}
+			t.Cleanup(func() {
+				git.Mocks.ExecSafe = nil
+			})
+
+			git.Mocks.ResolveRevision = func(spec string, opt git.ResolveRevisionOptions) (api.CommitID, error) {
+				return "", tt.resolveRevisionErr
+			}
+			t.Cleanup(func() {
+				git.Mocks.ResolveRevision = nil
+			})
+
+			res := &RepositoryResolver{RepoMatch: result.RepoMatch{Name: "repo"}}
+			branch, err := res.DefaultBranch(ctx)
+			if tt.wantErr != nil && err != nil {
+				if tt.wantErr.Error() != err.Error() {
+					t.Fatalf("incorrect error message, want=%q have=%q", tt.wantErr.Error(), err.Error())
+				}
+			} else if tt.wantErr != err {
+				t.Fatalf("incorrect error, want=%v have=%v", tt.wantErr, err)
+			}
+			if branch == nil && tt.wantBranch != nil {
+				t.Fatal("invalid nil resolver returned")
+			}
+			if branch != nil && tt.wantBranch == nil {
+				t.Fatalf("expected nil resolver but got %q", branch.name)
+			}
+			if tt.wantBranch != nil && branch.name != tt.wantBranch.name {
+				t.Fatalf("wrong resolver returned, want=%q have=%q", branch.name, tt.wantBranch.name)
+			}
+		})
 	}
 }

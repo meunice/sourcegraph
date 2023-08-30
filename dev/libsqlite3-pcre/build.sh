@@ -59,7 +59,7 @@ function build() {
         ;;
 
       *)
-        echo "See the local development documentation: https://github.com/sourcegraph/sourcegraph/blob/master/doc/dev/local_development.md#step-2-install-dependencies"
+        echo "See the local development documentation: https://github.com/sourcegraph/sourcegraph/blob/main/doc/dev/local_development.md#step-2-install-dependencies"
         ;;
     esac
 
@@ -74,19 +74,20 @@ function build() {
     darwin*)
       # pkg-config spits out multiple arguments and must not be quoted.
       # shellcheck disable=SC2046
-      gcc -fno-common -dynamiclib pcre.c -o "$libsqlite_path" $(pkg-config --cflags sqlite3 libpcre) $(pkg-config --libs libpcre) -fPIC
+      gcc -fno-common -dynamiclib pcre.c -o "$libsqlite_path" $(pkg-config --cflags sqlite3 libpcre) $(pkg-config --libs libpcre sqlite3) -fPIC
       exit 0
       ;;
 
     linux*)
       # pkg-config spits out multiple arguments and must not be quoted.
       # shellcheck disable=SC2046
-      gcc -shared -o "$libsqlite_path" $(pkg-config --cflags sqlite3 libpcre) -fPIC -W -Werror pcre.c $(pkg-config --libs libpcre) -Wl,-z,defs
+      gcc -shared -o "$libsqlite_path" $(pkg-config --cflags sqlite3 libpcre) -fPIC -W -Werror pcre.c $(pkg-config --libs libpcre sqlite3) -Wl,-z,defs
       exit 0
       ;;
 
     *)
-      echo "See the local development documentation: https://github.com/sourcegraph/sourcegraph/blob/master/doc/dev/local_development.md#step-2-install-dependencies"Uecho "Unknown platform $OSTYPE"
+      echo "See the local development documentation: https://github.com/sourcegraph/sourcegraph/blob/main/doc/dev/local_development.md#step-2-install-dependencies"
+      echo "Unknown platform $OSTYPE"
       exit 1
       ;;
   esac

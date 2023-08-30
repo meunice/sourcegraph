@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"github.com/sourcegraph/sourcegraph/internal/api"
-	"github.com/sourcegraph/sourcegraph/internal/gitserver"
 )
 
 // Request represents a request to searcher
@@ -22,6 +21,10 @@ type Request struct {
 	// not a ref like HEAD or master. eg
 	// "599cba5e7b6137d46ddf58fb1765f5d928e69604"
 	Commit api.CommitID
+
+	// Branch is used for structural search as an alternative to Commit
+	// because Zoekt only takes branch names
+	Branch string
 
 	PatternInfo
 
@@ -42,10 +45,15 @@ type Request struct {
 	// The deadline for the search request.
 	// It is parsed with time.Time.UnmarshalText.
 	Deadline string
-}
 
-// GitserverRepo returns the repository information necessary to perform gitserver requests.
-func (r Request) GitserverRepo() gitserver.Repo { return gitserver.Repo{Name: r.Repo} }
+	// Endpoint(s) for reaching Zoekt. See description in
+	// endpoint.go:Static(...)
+	IndexerEndpoints []string
+
+	// Whether the revision to be searched is indexed or unindexed. This matters for
+	// structural search because it will query Zoekt for indexed structural search.
+	Indexed bool
+}
 
 // PatternInfo describes a search request on a repo. Most of the fields
 // are based on PatternInfo used in vscode.
@@ -53,6 +61,10 @@ type PatternInfo struct {
 	// Pattern is the search query. It is a regular expression if IsRegExp
 	// is true, otherwise a fixed string. eg "route variable"
 	Pattern string
+
+	// IsNegated if true will invert the matching logic for regexp searches. IsNegated=true is
+	// not supported for structural searches.
+	IsNegated bool
 
 	// IsRegExp if true will treat the Pattern as a regular expression.
 	IsRegExp bool
@@ -89,8 +101,9 @@ type PatternInfo struct {
 	// and IncludePatterns are case sensitive.
 	PathPatternsAreCaseSensitive bool
 
-	// FileMatchLimit limits the number of files with matches that are returned.
-	FileMatchLimit int
+	// Limit is the cap on the total number of matches returned.
+	// A match is either a path match, or a fragment of a line matched by the query.
+	Limit int
 
 	// PatternMatchesPath is whether the pattern should be matched against the content
 	// of files.
@@ -103,8 +116,17 @@ type PatternInfo struct {
 	// Languages is the languages passed via the lang filters (e.g., "lang:c")
 	Languages []string
 
-	// CombyRule is a rule that constrains matching for structural search. It only applies when IsStructuralPat is true.
+	// CombyRule is a rule that constrains matching for structural search.
+	// It only applies when IsStructuralPat is true.
+	// As a temporary measure, the expression `where "backcompat" == "backcompat"` acts as
+	// a flag to activate the old structural search path, which queries zoekt for the
+	// file list in the frontend and passes it to searcher.
 	CombyRule string
+
+	// Select is the value of the the select field in the query. It is not necessary to
+	// use it since selection is done after the query completes, but exposing it can enable
+	// optimizations.
+	Select string
 }
 
 func (p *PatternInfo) String() string {
@@ -131,11 +153,14 @@ func (p *PatternInfo) String() string {
 	if !p.PatternMatchesPath {
 		args = append(args, "nopath")
 	}
-	if p.FileMatchLimit > 0 {
-		args = append(args, fmt.Sprintf("filematchlimit:%d", p.FileMatchLimit))
+	if p.Limit > 0 {
+		args = append(args, fmt.Sprintf("limit:%d", p.Limit))
 	}
 	for _, lang := range p.Languages {
 		args = append(args, fmt.Sprintf("lang:%s", lang))
+	}
+	if p.Select != "" {
+		args = append(args, fmt.Sprintf("select:%s", p.Select))
 	}
 
 	path := "glob"
@@ -170,7 +195,9 @@ type Response struct {
 type FileMatch struct {
 	Path        string
 	LineMatches []LineMatch
-	// MatchCount is the number of matches. Different from len(LineMatches), as multiple lines may correspond to one logical match.
+
+	// MatchCount is the number of matches.  Different from len(LineMatches), as multiple
+	// lines may correspond to one logical match when doing a structural search
 	MatchCount int
 
 	// LimitHit is true if LineMatches may not include all LineMatches.
@@ -190,7 +217,4 @@ type LineMatch struct {
 	// representing each match on a line.
 	// Offsets and lengths are measured in characters, not bytes.
 	OffsetAndLengths [][2]int
-
-	// LimitHit is true if OffsetAndLengths may not include all OffsetAndLengths.
-	LimitHit bool
 }

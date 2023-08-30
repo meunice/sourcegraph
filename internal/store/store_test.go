@@ -5,29 +5,29 @@ import (
 	"bytes"
 	"context"
 	"io"
-	"io/ioutil"
 	"os"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
+
 	"github.com/sourcegraph/sourcegraph/internal/api"
-	"github.com/sourcegraph/sourcegraph/internal/gitserver"
+	"github.com/sourcegraph/sourcegraph/internal/errcode"
 )
 
 func TestPrepareZip(t *testing.T) {
 	s, cleanup := tmpStore(t)
 	defer cleanup()
 
-	wantRepo := gitserver.Repo{Name: "foo"}
+	wantRepo := api.RepoName("foo")
 	wantCommit := api.CommitID("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
 
 	returnFetch := make(chan struct{})
-	var gotRepo gitserver.Repo
+	var gotRepo api.RepoName
 	var gotCommit api.CommitID
 	var fetchZipCalled int64
-	s.FetchTar = func(ctx context.Context, repo gitserver.Repo, commit api.CommitID) (io.ReadCloser, error) {
+	s.FetchTar = func(ctx context.Context, repo api.RepoName, commit api.CommitID) (io.ReadCloser, error) {
 		<-returnFetch
 		atomic.AddInt64(&fetchZipCalled, 1)
 		gotRepo = repo
@@ -65,7 +65,7 @@ func TestPrepareZip(t *testing.T) {
 	// use the disk cache.
 	onDisk := false
 	for i := 0; i < 500; i++ {
-		files, _ := ioutil.ReadDir(s.Path)
+		files, _ := os.ReadDir(s.Path)
 		if len(files) != 0 {
 			onDisk = true
 			break
@@ -85,11 +85,11 @@ func TestPrepareZip_fetchTarFail(t *testing.T) {
 	fetchErr := errors.New("test")
 	s, cleanup := tmpStore(t)
 	defer cleanup()
-	s.FetchTar = func(ctx context.Context, repo gitserver.Repo, commit api.CommitID) (io.ReadCloser, error) {
+	s.FetchTar = func(ctx context.Context, repo api.RepoName, commit api.CommitID) (io.ReadCloser, error) {
 		return nil, fetchErr
 	}
-	_, err := s.PrepareZip(context.Background(), gitserver.Repo{Name: "foo"}, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
-	if errors.Cause(err) != fetchErr {
+	_, err := s.PrepareZip(context.Background(), "foo", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+	if !errors.Is(err, fetchErr) {
 		t.Fatalf("expected PrepareZip to fail with %v, failed with %v", fetchErr, err)
 	}
 }
@@ -97,7 +97,7 @@ func TestPrepareZip_fetchTarFail(t *testing.T) {
 func TestPrepareZip_errHeader(t *testing.T) {
 	s, cleanup := tmpStore(t)
 	defer cleanup()
-	s.FetchTar = func(ctx context.Context, repo gitserver.Repo, commit api.CommitID) (io.ReadCloser, error) {
+	s.FetchTar = func(ctx context.Context, repo api.RepoName, commit api.CommitID) (io.ReadCloser, error) {
 		buf := new(bytes.Buffer)
 		w := tar.NewWriter(buf)
 		w.Flush()
@@ -106,13 +106,13 @@ func TestPrepareZip_errHeader(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return ioutil.NopCloser(bytes.NewReader(buf.Bytes())), nil
+		return io.NopCloser(bytes.NewReader(buf.Bytes())), nil
 	}
-	_, err := s.PrepareZip(context.Background(), gitserver.Repo{Name: "foo"}, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
-	if got, want := errors.Cause(err).Error(), tar.ErrHeader.Error(); got != want {
-		t.Fatalf("expected PrepareZip to fail with tar.ErrHeader, failed with %v", got)
+	_, err := s.PrepareZip(context.Background(), "foo", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+	if have, want := errors.Cause(err).Error(), tar.ErrHeader.Error(); have != want {
+		t.Fatalf("expected PrepareZip to fail with tar.ErrHeader, failed with %v", err)
 	}
-	if !errors.Cause(err).(interface{ Temporary() bool }).Temporary() {
+	if !errcode.IsTemporary(err) {
 		t.Fatalf("expected PrepareZip to fail with a temporary error, failed with %v", err)
 	}
 }
@@ -149,7 +149,7 @@ func TestIngoreSizeMax(t *testing.T) {
 }
 
 func tmpStore(t *testing.T) (*Store, func()) {
-	d, err := ioutil.TempDir("", "store_test")
+	d, err := os.MkdirTemp("", "store_test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,5 +165,5 @@ func emptyTar(t *testing.T) io.ReadCloser {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return ioutil.NopCloser(bytes.NewReader(buf.Bytes()))
+	return io.NopCloser(bytes.NewReader(buf.Bytes()))
 }

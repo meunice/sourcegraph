@@ -4,19 +4,21 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"golang.org/x/net/context/ctxhttp"
+
 	"github.com/sourcegraph/sourcegraph/internal/conf/conftypes"
 	"github.com/sourcegraph/sourcegraph/internal/env"
 	"github.com/sourcegraph/sourcegraph/internal/jsonc"
 	"github.com/sourcegraph/sourcegraph/internal/txemail/txtypes"
 	"github.com/sourcegraph/sourcegraph/schema"
-	"golang.org/x/net/context/ctxhttp"
 )
 
 var frontendInternal = env.Get("SRC_FRONTEND_INTERNAL", "sourcegraph-frontend-internal", "HTTP address for internal frontend HTTP API.")
@@ -28,15 +30,11 @@ type internalClient struct {
 
 var InternalClient = &internalClient{URL: "http://" + frontendInternal}
 
-var requestDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+var requestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Name:    "src_frontend_internal_request_duration_seconds",
 	Help:    "Time (in seconds) spent on request.",
 	Buckets: prometheus.DefBuckets,
 }, []string{"category", "code"})
-
-func init() {
-	prometheus.MustRegister(requestDuration)
-}
 
 // WaitForFrontend retries a noop request to the internal API until it is able to reach
 // the endpoint, indicating that the frontend is available.
@@ -48,9 +46,9 @@ func (c *internalClient) WaitForFrontend(ctx context.Context) error {
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			return fmt.Errorf("ping: bad HTTP response status %d", resp.StatusCode)
+			return errors.Errorf("ping: bad HTTP response status %d", resp.StatusCode)
 		}
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return err
 		}
@@ -59,7 +57,7 @@ func (c *internalClient) WaitForFrontend(ctx context.Context) error {
 			if len(body) > max {
 				body = body[:max]
 			}
-			return fmt.Errorf("ping: bad HTTP response body %q (want %q)", body, want)
+			return errors.Errorf("ping: bad HTTP response body %q (want %q)", body, want)
 		}
 		return nil
 	}
@@ -69,7 +67,7 @@ func (c *internalClient) WaitForFrontend(ctx context.Context) error {
 		err := ping(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
-				return fmt.Errorf("frontend API not reachable: %s (last error: %v)", err, lastErr)
+				return errors.Errorf("frontend API not reachable: %s (last error: %v)", err, lastErr)
 			}
 
 			// Keep trying.
@@ -355,9 +353,9 @@ func checkAPIResponse(resp *http.Response) error {
 		b := buf.Bytes()
 		errString := string(b)
 		if errString != "" {
-			return fmt.Errorf("internal API response error code %d: %s (%s)", resp.StatusCode, errString, resp.Request.URL)
+			return errors.Errorf("internal API response error code %d: %s (%s)", resp.StatusCode, errString, resp.Request.URL)
 		}
-		return fmt.Errorf("internal API response error code %d (%s)", resp.StatusCode, resp.Request.URL)
+		return errors.Errorf("internal API response error code %d (%s)", resp.StatusCode, resp.Request.URL)
 	}
 	return nil
 }

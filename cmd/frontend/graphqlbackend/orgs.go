@@ -5,32 +5,34 @@ import (
 
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/backend"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/graphqlbackend/graphqlutil"
-	"github.com/sourcegraph/sourcegraph/internal/db"
+	"github.com/sourcegraph/sourcegraph/internal/database"
+	"github.com/sourcegraph/sourcegraph/internal/database/dbutil"
 )
 
 func (r *schemaResolver) Organizations(args *struct {
 	graphqlutil.ConnectionArgs
 	Query *string
 }) *orgConnectionResolver {
-	var opt db.OrgsListOptions
+	var opt database.OrgsListOptions
 	if args.Query != nil {
 		opt.Query = *args.Query
 	}
 	args.ConnectionArgs.Set(&opt.LimitOffset)
-	return &orgConnectionResolver{opt: opt}
+	return &orgConnectionResolver{db: r.db, opt: opt}
 }
 
 type orgConnectionResolver struct {
-	opt db.OrgsListOptions
+	db  dbutil.DB
+	opt database.OrgsListOptions
 }
 
 func (r *orgConnectionResolver) Nodes(ctx context.Context) ([]*OrgResolver, error) {
-	// 🚨 SECURITY: Only site admins can list orgs.
-	if err := backend.CheckCurrentUserIsSiteAdmin(ctx); err != nil {
+	// 🚨 SECURITY: Only site admins can list organisations.
+	if err := backend.CheckCurrentUserIsSiteAdmin(ctx, r.db); err != nil {
 		return nil, err
 	}
 
-	orgs, err := db.Orgs.List(ctx, &r.opt)
+	orgs, err := database.Orgs(r.db).List(ctx, &r.opt)
 	if err != nil {
 		return nil, err
 	}
@@ -38,6 +40,7 @@ func (r *orgConnectionResolver) Nodes(ctx context.Context) ([]*OrgResolver, erro
 	var l []*OrgResolver
 	for _, org := range orgs {
 		l = append(l, &OrgResolver{
+			db:  r.db,
 			org: org,
 		})
 	}
@@ -45,12 +48,12 @@ func (r *orgConnectionResolver) Nodes(ctx context.Context) ([]*OrgResolver, erro
 }
 
 func (r *orgConnectionResolver) TotalCount(ctx context.Context) (int32, error) {
-	// 🚨 SECURITY: Only site admins can count orgs.
-	if err := backend.CheckCurrentUserIsSiteAdmin(ctx); err != nil {
+	// 🚨 SECURITY: Only site admins can count organisations.
+	if err := backend.CheckCurrentUserIsSiteAdmin(ctx, r.db); err != nil {
 		return 0, err
 	}
 
-	count, err := db.Orgs.Count(ctx, r.opt)
+	count, err := database.Orgs(r.db).Count(ctx, r.opt)
 	return int32(count), err
 }
 

@@ -5,20 +5,21 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"io/fs"
 	"os"
 	"reflect"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/inconshreveable/log15"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/inventory"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/types"
+
 	"github.com/sourcegraph/sourcegraph/internal/api"
-	"github.com/sourcegraph/sourcegraph/internal/db"
+	"github.com/sourcegraph/sourcegraph/internal/database"
+	"github.com/sourcegraph/sourcegraph/internal/inventory"
 	"github.com/sourcegraph/sourcegraph/internal/rcache"
 	"github.com/sourcegraph/sourcegraph/internal/repoupdater"
 	"github.com/sourcegraph/sourcegraph/internal/repoupdater/protocol"
+	"github.com/sourcegraph/sourcegraph/internal/types"
 	"github.com/sourcegraph/sourcegraph/internal/vcs/git"
 	"github.com/sourcegraph/sourcegraph/internal/vcs/util"
 )
@@ -29,7 +30,7 @@ func TestReposService_Get(t *testing.T) {
 
 	wantRepo := &types.Repo{ID: 1, Name: "github.com/u/r"}
 
-	calledGet := db.Mocks.Repos.MockGet_Return(t, wantRepo)
+	calledGet := database.Mocks.Repos.MockGet_Return(t, wantRepo)
 
 	repo, err := s.Get(ctx, 1)
 	if err != nil {
@@ -53,9 +54,9 @@ func TestReposService_List(t *testing.T) {
 		{Name: "r2"},
 	}
 
-	calledList := db.Mocks.Repos.MockList(t, "r1", "r2")
+	calledList := database.Mocks.Repos.MockList(t, "r1", "r2")
 
-	repos, err := s.List(ctx, db.ReposListOptions{})
+	repos, err := s.List(ctx, database.ReposListOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,6 +73,7 @@ func TestRepos_Add(t *testing.T) {
 	ctx := testContext()
 
 	const repoName = "my/repo"
+	const newName = "my/repo2"
 
 	calledRepoLookup := false
 	repoupdater.MockRepoLookup = func(args protocol.RepoLookupArgs) (*protocol.RepoLookupResult, error) {
@@ -80,13 +82,18 @@ func TestRepos_Add(t *testing.T) {
 			t.Errorf("got %q, want %q", args.Repo, repoName)
 		}
 		return &protocol.RepoLookupResult{
-			Repo: &protocol.RepoInfo{Name: repoName, Description: "d"},
+			Repo: &protocol.RepoInfo{Name: newName, Description: "d"},
 		}, nil
 	}
 	defer func() { repoupdater.MockRepoLookup = nil }()
 
-	if err := s.Add(ctx, repoName); err != nil {
+	// The repoName could change if it has been renamed on the code host
+	addedName, err := s.Add(ctx, repoName)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if addedName != newName {
+		t.Fatalf("Want %q, got %q", newName, addedName)
 	}
 	if !calledRepoLookup {
 		t.Error("!calledRepoLookup")
@@ -117,24 +124,24 @@ func TestReposGetInventory(t *testing.T) {
 		return &protocol.RepoLookupResult{Repo: &protocol.RepoInfo{Name: wantRepo}}, nil
 	}
 	defer func() { repoupdater.MockRepoLookup = nil }()
-	git.Mocks.Stat = func(commit api.CommitID, path string) (os.FileInfo, error) {
+	git.Mocks.Stat = func(commit api.CommitID, path string) (fs.FileInfo, error) {
 		if commit != wantCommitID {
 			t.Errorf("got commit %q, want %q", commit, wantCommitID)
 		}
 		return &util.FileInfo{Name_: path, Mode_: os.ModeDir, Sys_: gitObjectInfo(wantRootOID)}, nil
 	}
-	git.Mocks.ReadDir = func(commit api.CommitID, name string, recurse bool) ([]os.FileInfo, error) {
+	git.Mocks.ReadDir = func(commit api.CommitID, name string, recurse bool) ([]fs.FileInfo, error) {
 		if commit != wantCommitID {
 			t.Errorf("got commit %q, want %q", commit, wantCommitID)
 		}
 		switch name {
 		case "":
-			return []os.FileInfo{
+			return []fs.FileInfo{
 				&util.FileInfo{Name_: "a", Mode_: os.ModeDir, Sys_: gitObjectInfo("oid-a")},
 				&util.FileInfo{Name_: "b.go", Size_: 12},
 			}, nil
 		case "a":
-			return []os.FileInfo{&util.FileInfo{Name_: "a/c.m", Size_: 24}}, nil
+			return []fs.FileInfo{&util.FileInfo{Name_: "a/c.m", Size_: 24}}, nil
 		default:
 			panic("unhandled mock ReadDir " + name)
 		}
@@ -152,7 +159,7 @@ func TestReposGetInventory(t *testing.T) {
 		default:
 			panic("unhandled mock ReadFile " + name)
 		}
-		return ioutil.NopCloser(bytes.NewReader(data)), nil
+		return io.NopCloser(bytes.NewReader(data)), nil
 	}
 	defer git.ResetMocks()
 

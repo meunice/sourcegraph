@@ -2,17 +2,17 @@ package git
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"strings"
 
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/sourcegraph/go-diff/diff"
-	"github.com/sourcegraph/sourcegraph/internal/gitserver"
+
+	"github.com/sourcegraph/sourcegraph/internal/api"
 )
 
 type DiffOptions struct {
-	Repo gitserver.Repo
+	Repo api.RepoName
 
 	// These fields must be valid <commit> inputs as defined by gitrevisions(7).
 	Base string
@@ -33,7 +33,7 @@ func Diff(ctx context.Context, opts DiffOptions) (*DiffFileIterator, error) {
 	if strings.HasPrefix(rangeSpec, "-") || strings.HasPrefix(rangeSpec, ".") {
 		// We don't want to allow user input to add `git diff` command line
 		// flags or refer to a file.
-		return nil, fmt.Errorf("invalid diff range argument: %q", rangeSpec)
+		return nil, errors.Errorf("invalid diff range argument: %q", rangeSpec)
 	}
 
 	rdr, err := ExecReader(ctx, opts.Repo, []string{

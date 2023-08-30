@@ -2,7 +2,7 @@ package gitlab
 
 import (
 	"bytes"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -23,7 +23,7 @@ func (s *mockHTTPResponseBody) Do(req *http.Request) (*http.Response, error) {
 	return &http.Response{
 		Request:    req,
 		StatusCode: http.StatusOK,
-		Body:       ioutil.NopCloser(strings.NewReader(s.responseBody)),
+		Body:       io.NopCloser(strings.NewReader(s.responseBody)),
 		Header:     s.header,
 	}, nil
 }
@@ -36,7 +36,7 @@ func (s mockHTTPEmptyResponse) Do(req *http.Request) (*http.Response, error) {
 	return &http.Response{
 		Request:    req,
 		StatusCode: s.statusCode,
-		Body:       ioutil.NopCloser(bytes.NewReader(nil)),
+		Body:       io.NopCloser(bytes.NewReader(nil)),
 	}, nil
 }
 
@@ -45,7 +45,7 @@ func newTestClient(t *testing.T) *Client {
 	return &Client{
 		baseURL:          &url.URL{Scheme: "https", Host: "example.com", Path: "/"},
 		httpClient:       &http.Client{},
-		RateLimitMonitor: &ratelimit.Monitor{},
+		rateLimitMonitor: &ratelimit.Monitor{},
 		projCache:        rcache.NewWithTTL("__test__gl_proj", 1000),
 	}
 }

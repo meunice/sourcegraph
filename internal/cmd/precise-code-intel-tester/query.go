@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/google/go-cmp/cmp"
+
 	"github.com/sourcegraph/sourcegraph/internal/cmd/precise-code-intel-tester/util"
 )
 
@@ -79,6 +82,8 @@ func referencesFromReferencesQueries() []util.ParallelFn {
 // makeTestQueryFunction constructs a function for RunParallel that invokes the given query function and
 // checks the returned locations against the given expected locations.
 func makeTestQueryFunction(name string, location Location, expectedLocations []Location, f QueryFunc) util.ParallelFn {
+	var numFinished int32
+
 	fn := func(ctx context.Context) error {
 		locations, err := f(ctx, location)
 		if err != nil {
@@ -89,10 +94,11 @@ func makeTestQueryFunction(name string, location Location, expectedLocations []L
 			sortLocations(locations)
 
 			if diff := cmp.Diff(expectedLocations, locations); diff != "" {
-				return fmt.Errorf("unexpected locations (-want +got):\n%s", diff)
+				return errors.Errorf("unexpected locations (-want +got):\n%s", diff)
 			}
 		}
 
+		atomic.AddInt32(&numFinished, 1)
 		return nil
 	}
 
@@ -106,7 +112,12 @@ func makeTestQueryFunction(name string, location Location, expectedLocations []L
 		location.Character,
 	)
 
-	return util.ParallelFn{Fn: fn, Description: description}
+	return util.ParallelFn{
+		Fn:          fn,
+		Description: func() string { return description },
+		Total:       func() int { return 1 },
+		Finished:    func() int { return int(atomic.LoadInt32(&numFinished)) },
+	}
 }
 
 // QueryFunc performs a GraphQL query (definition or references) given the source location.
@@ -162,7 +173,7 @@ func queryDefinitions(ctx context.Context, location Location) (locations []Locat
 	}
 
 	payload := QueryResponse{}
-	if err := util.QueryGraphQL(ctx, endpoint, token, query, variables, &payload); err != nil {
+	if err := util.QueryGraphQL(ctx, endpoint, "CodeIntelTesterDefinitions", token, query, variables, &payload); err != nil {
 		return nil, err
 	}
 
@@ -236,7 +247,7 @@ func queryReferences(ctx context.Context, location Location) (locations []Locati
 		}
 
 		payload := QueryResponse{}
-		if err := util.QueryGraphQL(ctx, endpoint, token, query, variables, &payload); err != nil {
+		if err := util.QueryGraphQL(ctx, endpoint, "CodeIntelTesterReferences", token, query, variables, &payload); err != nil {
 			return nil, err
 		}
 

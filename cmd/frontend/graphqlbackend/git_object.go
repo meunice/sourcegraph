@@ -2,10 +2,10 @@ package graphqlbackend
 
 import (
 	"context"
-	"errors"
 	"sync"
 
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/backend"
+	"github.com/cockroachdb/errors"
+
 	"github.com/sourcegraph/sourcegraph/internal/vcs/git"
 )
 
@@ -77,12 +77,7 @@ type gitObjectResolver struct {
 
 func (o *gitObjectResolver) resolve(ctx context.Context) (GitObjectID, gitObjectType, error) {
 	o.once.Do(func() {
-		cachedRepo, err := backend.CachedGitRepo(ctx, o.repo.repo)
-		if err != nil {
-			o.err = err
-			return
-		}
-		oid, objectType, err := git.GetObject(ctx, *cachedRepo, o.revspec)
+		oid, objectType, err := git.GetObject(ctx, o.repo.RepoName(), o.revspec)
 		if err != nil {
 			o.err = err
 			return

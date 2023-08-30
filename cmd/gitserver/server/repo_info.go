@@ -3,9 +3,14 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 
+	"github.com/cockroachdb/errors"
 	"github.com/inconshreveable/log15"
+
 	"github.com/sourcegraph/sourcegraph/internal/api"
 	"github.com/sourcegraph/sourcegraph/internal/gitserver/protocol"
 )
@@ -16,11 +21,14 @@ func (s *Server) repoInfo(ctx context.Context, repo api.RepoName) (*protocol.Rep
 		Cloned: repoCloned(dir),
 	}
 	if resp.Cloned {
-		remoteURL, err := repoRemoteURL(ctx, dir)
+		// TODO(keegancsmith,tsenart) the only user of this information is the
+		// site admin settings page for a repo. That page should just ask the
+		// DB for the remote URL.
+		remoteURL, err := s.getRemoteURL(ctx, repo)
 		if err != nil {
 			return nil, err
 		}
-		resp.URL = remoteURL
+		resp.URL = remoteURL.String()
 	}
 	{
 		resp.CloneProgress, resp.CloneInProgress = s.locker.Status(dir)
@@ -37,7 +45,7 @@ func (s *Server) repoInfo(ctx context.Context, repo api.RepoName) (*protocol.Rep
 		}
 
 		if cloneTime, err := getRecloneTime(dir); err != nil {
-			log15.Warn("error getting reclone time", "repo", repo, "err", err)
+			log15.Warn("error getting re-clone time", "repo", repo, "err", err)
 		} else {
 			resp.CloneTime = &cloneTime
 		}
@@ -87,6 +95,22 @@ func (s *Server) handleRepoInfo(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+}
+
+func (s *Server) handleReposStats(w http.ResponseWriter, r *http.Request) {
+	b, err := os.ReadFile(filepath.Join(s.ReposDir, reposStatsName))
+	if errors.Is(err, os.ErrNotExist) {
+		// When a gitserver is new this file might not have been computed
+		// yet. Clients are expected to handle this case by noticing UpdatedAt
+		// is not set.
+		b = []byte("{}")
+	} else if err != nil {
+		http.Error(w, fmt.Sprintf("failed to read %s: %v", reposStatsName, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_, _ = w.Write(b)
 }
 
 func (s *Server) handleRepoCloneProgress(w http.ResponseWriter, r *http.Request) {

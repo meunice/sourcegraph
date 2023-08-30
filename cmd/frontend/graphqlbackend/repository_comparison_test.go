@@ -2,55 +2,57 @@ package graphqlbackend
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"html/template"
 	"io"
-	"io/ioutil"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/google/go-cmp/cmp"
 	"github.com/sourcegraph/go-diff/diff"
+
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/graphqlbackend/externallink"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/graphqlbackend/graphqlutil"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/types"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/highlight"
 	"github.com/sourcegraph/sourcegraph/internal/api"
-	"github.com/sourcegraph/sourcegraph/internal/gitserver"
-	"github.com/sourcegraph/sourcegraph/internal/highlight"
+	"github.com/sourcegraph/sourcegraph/internal/database/dbtesting"
+	"github.com/sourcegraph/sourcegraph/internal/types"
 	"github.com/sourcegraph/sourcegraph/internal/vcs/git"
 )
 
 func TestRepositoryComparison(t *testing.T) {
 	ctx := context.Background()
+	db := new(dbtesting.MockDB)
 
 	wantBaseRevision := "24f7ca7c1190835519e261d7eefa09df55ceea4f"
 	wantMergeBaseRevision := "a7985dde7f92ad3490ec513be78fa2b365c7534c"
 	wantHeadRevision := "b69072d5f687b31b9f6ae3ceafdc24c259c4b9ec"
 
 	repo := &types.Repo{
-		ID:   api.RepoID(1),
-		Name: api.RepoName("github.com/sourcegraph/sourcegraph"),
+		ID:        api.RepoID(1),
+		Name:      api.RepoName("github.com/sourcegraph/sourcegraph"),
+		CreatedAt: time.Now(),
 	}
 
-	git.Mocks.GetCommit = func(id api.CommitID) (*git.Commit, error) {
-		if string(id) != wantMergeBaseRevision && string(id) != wantHeadRevision {
-			t.Fatalf("GetCommit received wrong ID: %s", id)
+	git.Mocks.ResolveRevision = func(spec string, opt git.ResolveRevisionOptions) (api.CommitID, error) {
+		if spec != wantMergeBaseRevision && spec != wantHeadRevision {
+			t.Fatalf("ResolveRevision received wrong spec: %s", spec)
 		}
-
-		return &git.Commit{ID: id}, nil
+		return api.CommitID(spec), nil
 	}
-	t.Cleanup(func() { git.Mocks.GetCommit = nil })
+	t.Cleanup(func() { git.Mocks.ResolveRevision = nil })
 
 	git.Mocks.ExecReader = func(args []string) (io.ReadCloser, error) {
 		if len(args) < 1 && args[0] != "diff" {
 			t.Fatalf("gitserver.ExecReader received wrong args: %v", args)
 		}
-		return ioutil.NopCloser(strings.NewReader(testDiff + testCopyDiff)), nil
+		return io.NopCloser(strings.NewReader(testDiff + testCopyDiff)), nil
 	}
 	t.Cleanup(func() { git.Mocks.ExecReader = nil })
 
-	git.Mocks.MergeBase = func(repo gitserver.Repo, a, b api.CommitID) (api.CommitID, error) {
+	git.Mocks.MergeBase = func(repo api.RepoName, a, b api.CommitID) (api.CommitID, error) {
 		if string(a) != wantBaseRevision || string(b) != wantHeadRevision {
 			t.Fatalf("gitserver.MergeBase received wrong args: %s %s", a, b)
 		}
@@ -59,9 +61,9 @@ func TestRepositoryComparison(t *testing.T) {
 	t.Cleanup(func() { git.Mocks.MergeBase = nil })
 
 	input := &RepositoryComparisonInput{Base: &wantBaseRevision, Head: &wantHeadRevision}
-	repoResolver := NewRepositoryResolver(repo)
+	repoResolver := NewRepositoryResolver(db, repo)
 
-	comp, err := NewRepositoryComparison(ctx, repoResolver, input)
+	comp, err := NewRepositoryComparison(ctx, db, repoResolver, input)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +95,7 @@ func TestRepositoryComparison(t *testing.T) {
 			{ID: api.CommitID(wantHeadRevision)},
 		}
 
-		git.Mocks.Commits = func(repo gitserver.Repo, opts git.CommitsOptions) ([]*git.Commit, error) {
+		git.Mocks.Commits = func(repo api.RepoName, opts git.CommitsOptions) ([]*git.Commit, error) {
 			wantRange := fmt.Sprintf("%s..%s", wantBaseRevision, wantHeadRevision)
 
 			if have, want := opts.Range, wantRange; have != want {
@@ -135,7 +137,10 @@ func TestRepositoryComparison(t *testing.T) {
 
 	t.Run("FileDiffs", func(t *testing.T) {
 		t.Run("RawDiff", func(t *testing.T) {
-			diffConnection := comp.FileDiffs(&FileDiffsConnectionArgs{})
+			diffConnection, err := comp.FileDiffs(ctx, &FileDiffsConnectionArgs{})
+			if err != nil {
+				t.Fatal(err)
+			}
 
 			rawDiff, err := diffConnection.RawDiff(ctx)
 			if err != nil {
@@ -147,7 +152,10 @@ func TestRepositoryComparison(t *testing.T) {
 		})
 
 		t.Run("DiffStat", func(t *testing.T) {
-			diffConnection := comp.FileDiffs(&FileDiffsConnectionArgs{})
+			diffConnection, err := comp.FileDiffs(ctx, &FileDiffsConnectionArgs{})
+			if err != nil {
+				t.Fatal(err)
+			}
 
 			diffStat, err := diffConnection.DiffStat(ctx)
 			if err != nil {
@@ -161,7 +169,10 @@ func TestRepositoryComparison(t *testing.T) {
 		})
 
 		t.Run("FileDiff", func(t *testing.T) {
-			diffConnection := comp.FileDiffs(&FileDiffsConnectionArgs{})
+			diffConnection, err := comp.FileDiffs(ctx, &FileDiffsConnectionArgs{})
+			if err != nil {
+				t.Fatal(err)
+			}
 
 			nodes, err := diffConnection.Nodes(ctx)
 			if err != nil {
@@ -212,20 +223,14 @@ func TestRepositoryComparison(t *testing.T) {
 			if mostRelevant == nil {
 				t.Fatalf("MostRelevantFile is nil")
 			}
-			relevantURL, err := mostRelevant.CanonicalURL()
-			if err != nil {
-				t.Fatal(err)
-			}
+			relevantURL := mostRelevant.CanonicalURL()
 
 			wantRelevantURL := fmt.Sprintf("/%s@%s/-/blob/%s", repo.Name, wantHeadRevision, "INSTALL.md")
 			if relevantURL != wantRelevantURL {
 				t.Fatalf("MostRelevantFile.CanonicalURL() is wrong. have=%q, want=%q", relevantURL, wantRelevantURL)
 			}
 
-			newFileURL, err := newFile.CanonicalURL()
-			if err != nil {
-				t.Fatal(err)
-			}
+			newFileURL := newFile.CanonicalURL()
 			// NewFile should be the most relevant file
 			if newFileURL != wantRelevantURL {
 				t.Fatalf(
@@ -298,7 +303,10 @@ func TestRepositoryComparison(t *testing.T) {
 					args.After = &tc.after
 				}
 
-				conn := comp.FileDiffs(args)
+				conn, err := comp.FileDiffs(ctx, args)
+				if err != nil {
+					t.Fatal(err)
+				}
 
 				nodes, err := conn.Nodes(ctx)
 				if err != nil {
@@ -429,6 +437,85 @@ func TestDiffHunk(t *testing.T) {
 	})
 }
 
+func TestDiffHunk2(t *testing.T) {
+	// This test exists to protect against panics related to
+	// https://github.com/sourcegraph/sourcegraph/pull/21068
+
+	ctx := context.Background()
+	filediff := `diff --git cmd/staticcheck/README.md cmd/staticcheck/README.md
+index 4d14577..10ef458 100644
+--- cmd/staticcheck/README.md
++++ cmd/staticcheck/README.md
+@@ -13,3 +13,5 @@ See [the main README](https://github.com/dominikh/go-tools#installation) for ins
+ Detailed documentation can be found on
+ [staticcheck.io](https://staticcheck.io/docs/).
+` + " " + `
++
++(c) Copyright Sourcegraph 2013-2021.
+\ No newline at end of file
+`
+	dr := diff.NewMultiFileDiffReader(strings.NewReader(filediff))
+	// We only read the first file diff from testDiff
+	fileDiff, err := dr.ReadFile()
+	if err != nil && err != io.EOF {
+		t.Fatalf("parsing diff failed: %s", err)
+	}
+
+	hunk := &DiffHunk{hunk: fileDiff.Hunks[0]}
+
+	t.Run("Highlight", func(t *testing.T) {
+		hunk.highlighter = &dummyFileHighlighter{
+			highlightedBase: []template.HTML{
+				"<div><span class=\"hl-text hl-html hl-markdown\"><span class=\"hl-meta hl-block-level hl-markdown\"><span class=\"hl-markup hl-heading hl-1 hl-markdown\"><span class=\"hl-punctuation hl-definition hl-heading hl-begin hl-markdown\">#</span> </span><span class=\"hl-markup hl-heading hl-1 hl-markdown\"><span class=\"hl-entity hl-name hl-section hl-markdown\">staticcheck</span><span class=\"hl-meta hl-whitespace hl-newline hl-markdown\">\n</span></span></span></span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\">\n</span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\">_staticcheck_ offers extensive analysis of Go code, covering a myriad\n</span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\">of categories. It will detect bugs, suggest code simplifications,\n</span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\">point out dead code, and more.\n</span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\">\n</span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\"><span class=\"hl-meta hl-block-level hl-markdown\"><span class=\"hl-markup hl-heading hl-2 hl-markdown\"><span class=\"hl-punctuation hl-definition hl-heading hl-begin hl-markdown\">##</span> </span><span class=\"hl-markup hl-heading hl-2 hl-markdown\"><span class=\"hl-entity hl-name hl-section hl-markdown\">Installation</span><span class=\"hl-meta hl-whitespace hl-newline hl-markdown\">\n</span></span></span></span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\">\n</span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\">See [the main README](https://github.com/dominikh/go-tools#installation) for installation instructions.\n</span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\">\n</span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\"><span class=\"hl-meta hl-block-level hl-markdown\"><span class=\"hl-markup hl-heading hl-2 hl-markdown\"><span class=\"hl-punctuation hl-definition hl-heading hl-begin hl-markdown\">##</span> </span><span class=\"hl-markup hl-heading hl-2 hl-markdown\"><span class=\"hl-entity hl-name hl-section hl-markdown\">Documentation</span><span class=\"hl-meta hl-whitespace hl-newline hl-markdown\">\n</span></span></span></span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\">\n</span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\">Detailed documentation can be found on\n</span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\">[staticcheck.io](https://staticcheck.io/docs/).\n</span></div>",
+			},
+			highlightedHead: []template.HTML{
+				"<div><span class=\"hl-text hl-html hl-markdown\"><span class=\"hl-meta hl-block-level hl-markdown\"><span class=\"hl-markup hl-heading hl-1 hl-markdown\"><span class=\"hl-punctuation hl-definition hl-heading hl-begin hl-markdown\">#</span> </span><span class=\"hl-markup hl-heading hl-1 hl-markdown\"><span class=\"hl-entity hl-name hl-section hl-markdown\">staticcheck</span><span class=\"hl-meta hl-whitespace hl-newline hl-markdown\">\n</span></span></span></span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\">\n</span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\">_staticcheck_ offers extensive analysis of Go code, covering a myriad\n</span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\">of categories. It will detect bugs, suggest code simplifications,\n</span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\">point out dead code, and more.\n</span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\">\n</span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\"><span class=\"hl-meta hl-block-level hl-markdown\"><span class=\"hl-markup hl-heading hl-2 hl-markdown\"><span class=\"hl-punctuation hl-definition hl-heading hl-begin hl-markdown\">##</span> </span><span class=\"hl-markup hl-heading hl-2 hl-markdown\"><span class=\"hl-entity hl-name hl-section hl-markdown\">Installation</span><span class=\"hl-meta hl-whitespace hl-newline hl-markdown\">\n</span></span></span></span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\">\n</span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\">See [the main README](https://github.com/dominikh/go-tools#installation) for installation instructions.\n</span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\">\n</span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\"><span class=\"hl-meta hl-block-level hl-markdown\"><span class=\"hl-markup hl-heading hl-2 hl-markdown\"><span class=\"hl-punctuation hl-definition hl-heading hl-begin hl-markdown\">##</span> </span><span class=\"hl-markup hl-heading hl-2 hl-markdown\"><span class=\"hl-entity hl-name hl-section hl-markdown\">Documentation</span><span class=\"hl-meta hl-whitespace hl-newline hl-markdown\">\n</span></span></span></span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\">\n</span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\">Detailed documentation can be found on\n</span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\">[staticcheck.io](https://staticcheck.io/docs/).\n</span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\">\n</span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\">\n</span></div>",
+				"<div><span class=\"hl-text hl-html hl-markdown\">(c) Copyright Sourcegraph 2013-2021.</span></div>",
+			},
+		}
+
+		body, err := hunk.Highlight(ctx, &HighlightArgs{
+			DisableTimeout:     false,
+			HighlightLongLines: false,
+			IsLightTheme:       true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if body.Aborted() {
+			t.Fatal("highlighting is aborted")
+		}
+	})
+}
+
 const testDiffFiles = 3
 const testDiff = `diff --git INSTALL.md INSTALL.md
 index e5af166..d44c3fc 100644
@@ -540,7 +627,7 @@ func TestFileDiffHighlighter(t *testing.T) {
 		case file2.path:
 			return template.HTML(highlightedNew), false, nil
 		default:
-			return "", false, fmt.Errorf("unknown file: %s", p.Filepath)
+			return "", false, errors.Errorf("unknown file: %s", p.Filepath)
 		}
 	}
 	t.Cleanup(highlight.ResetMocks)
@@ -614,8 +701,8 @@ func (d *dummyFileResolver) URL(ctx context.Context) (string, error) {
 	return d.url, nil
 }
 
-func (d *dummyFileResolver) CanonicalURL() (string, error) {
-	return d.canonicalURL, nil
+func (d *dummyFileResolver) CanonicalURL() string {
+	return d.canonicalURL
 }
 
 func (d *dummyFileResolver) ExternalURLs(ctx context.Context) ([]*externallink.Resolver, error) {

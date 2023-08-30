@@ -21,7 +21,9 @@ import (
 	"github.com/sourcegraph/sourcegraph/internal/debugserver"
 	"github.com/sourcegraph/sourcegraph/internal/env"
 	"github.com/sourcegraph/sourcegraph/internal/gitserver"
+	"github.com/sourcegraph/sourcegraph/internal/logging"
 	"github.com/sourcegraph/sourcegraph/internal/store"
+	"github.com/sourcegraph/sourcegraph/internal/trace"
 	"github.com/sourcegraph/sourcegraph/internal/trace/ot"
 	"github.com/sourcegraph/sourcegraph/internal/tracer"
 )
@@ -35,9 +37,14 @@ func main() {
 	env.Lock()
 	env.HandleHelpFlag()
 	log.SetFlags(0)
+	logging.Init()
 	tracer.Init()
+	trace.Init(true)
 
-	go debugserver.Start()
+	// Ready immediately
+	ready := make(chan struct{})
+	close(ready)
+	go debugserver.NewServerRoutine(ready).Start()
 
 	var cacheSizeBytes int64
 	if i, err := strconv.ParseInt(cacheSizeMB, 10, 64); err != nil {
@@ -48,15 +55,15 @@ func main() {
 
 	service := &search.Service{
 		Store: &store.Store{
-			FetchTar: func(ctx context.Context, repo gitserver.Repo, commit api.CommitID) (io.ReadCloser, error) {
+			FetchTar: func(ctx context.Context, repo api.RepoName, commit api.CommitID) (io.ReadCloser, error) {
 				return gitserver.DefaultClient.Archive(ctx, repo, gitserver.ArchiveOptions{Treeish: string(commit), Format: "tar"})
 			},
+			FilterTar:         search.NewFilter,
 			Path:              filepath.Join(cacheDir, "searcher-archives"),
 			MaxCacheSizeBytes: cacheSizeBytes,
 		},
 		Log: log15.Root(),
 	}
-	service.Store.SetMaxConcurrentFetchTar(10)
 	service.Store.Start()
 	handler := ot.Middleware(service)
 
@@ -66,7 +73,9 @@ func main() {
 	}
 	addr := net.JoinHostPort(host, port)
 	server := &http.Server{
-		Addr: addr,
+		ReadTimeout:  75 * time.Second,
+		WriteTimeout: 10 * time.Minute,
+		Addr:         addr,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// For cluster liveness and readiness probes
 			if r.URL.Path == "/healthz" {

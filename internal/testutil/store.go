@@ -5,11 +5,9 @@ import (
 	"bytes"
 	"context"
 	"io"
-	"io/ioutil"
 	"os"
 
 	"github.com/sourcegraph/sourcegraph/internal/api"
-	"github.com/sourcegraph/sourcegraph/internal/gitserver"
 	"github.com/sourcegraph/sourcegraph/internal/store"
 )
 
@@ -40,13 +38,13 @@ func NewStore(files map[string]string) (*store.Store, func(), error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	d, err := ioutil.TempDir("", "search_test")
+	d, err := os.MkdirTemp("", "search_test")
 	if err != nil {
 		return nil, nil, err
 	}
 	return &store.Store{
-		FetchTar: func(ctx context.Context, repo gitserver.Repo, commit api.CommitID) (io.ReadCloser, error) {
-			return ioutil.NopCloser(bytes.NewReader(buf.Bytes())), nil
+		FetchTar: func(ctx context.Context, repo api.RepoName, commit api.CommitID) (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(buf.Bytes())), nil
 		},
 		Path: d,
 	}, func() { os.RemoveAll(d) }, nil

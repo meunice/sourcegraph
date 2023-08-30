@@ -5,15 +5,13 @@
   {
     "expression": [
       "allof",
-      ["not", ["anyof", ["match", ".*"], ["suffix", "_test.go"]]],
+      ["not", ["anyof", ["match", ".*"], ["suffix", "_test.go"], ["dirname", "dev"]]],
       [
         "anyof",
         ["suffix", "go"],
-        ["dirname", "cmd/symbols"],
-        ["dirname", "schema"],
-        ["dirname", "docker-images/grafana/jsonnet"],
+        ["name", "cmd/frontend/graphqlbackend/*.graphql", "wholename"],
         ["dirname", "monitoring"],
-        ["name", "cmd/frontend/graphqlbackend/schema.graphql", "wholename"]
+        ["match", "schema/*.json", "wholename"]
       ]
     ],
     "fields": ["name"]

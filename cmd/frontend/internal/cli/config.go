@@ -4,24 +4,30 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
+	"net/url"
 	"os"
 	"os/user"
 	"strings"
 	"sync"
 
+	"github.com/cockroachdb/errors"
+	"github.com/fsnotify/fsnotify"
 	"github.com/inconshreveable/log15"
-	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/globals"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/types"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/confdb"
 	"github.com/sourcegraph/sourcegraph/internal/api"
 	"github.com/sourcegraph/sourcegraph/internal/conf"
 	"github.com/sourcegraph/sourcegraph/internal/conf/conftypes"
-	"github.com/sourcegraph/sourcegraph/internal/db"
-	"github.com/sourcegraph/sourcegraph/internal/db/confdb"
-	"github.com/sourcegraph/sourcegraph/internal/db/dbutil"
+	"github.com/sourcegraph/sourcegraph/internal/database"
+	"github.com/sourcegraph/sourcegraph/internal/database/dbutil"
+	"github.com/sourcegraph/sourcegraph/internal/extsvc"
 	"github.com/sourcegraph/sourcegraph/internal/jsonc"
+	"github.com/sourcegraph/sourcegraph/internal/types"
+	"github.com/sourcegraph/sourcegraph/schema"
 )
 
 func printConfigValidation() {
@@ -41,165 +47,299 @@ func printConfigValidation() {
 	}
 }
 
-// handleConfigOverrides handles allowing dev environments to forcibly override
-// the configuration in the database upon startup. This is used to e.g. ensure
-// dev environments have a consistent configuration and to load secrets from a
-// separate private repository.
-//
-// As this method writes to the configuration DB, it should be invoked before
-// the configuration server is started but after PostgreSQL is connected.
-func handleConfigOverrides() error {
-	ctx := context.Background()
+var (
+	metricConfigOverrideUpdates = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "src_frontend_config_file_watcher_updates",
+		Help: "Incremented each time the config file is updated.",
+	}, []string{"status"})
+)
 
-	overrideSiteConfig := os.Getenv("SITE_CONFIG_FILE")
-	overrideExtSvcConfig := os.Getenv("EXTSVC_CONFIG_FILE")
-	overrideGlobalSettings := os.Getenv("GLOBAL_SETTINGS_FILE")
-	overrideAny := overrideSiteConfig != "" || overrideExtSvcConfig != "" || overrideGlobalSettings != ""
-	if overrideAny || conf.IsDev(conf.DeployType()) {
+func overrideSiteConfig(ctx context.Context) error {
+	path := os.Getenv("SITE_CONFIG_FILE")
+	if path == "" {
+		return nil
+	}
+	var updateFunc = func(ctx context.Context) error {
 		raw, err := (&configurationSource{}).Read(ctx)
 		if err != nil {
-			return errors.Wrap(err, "reading existing config for applying overrides")
+			return err
+		}
+		site, err := os.ReadFile(path)
+		if err != nil {
+			return errors.Wrap(err, "reading SITE_CONFIG_FILE")
+		}
+		raw.Site = string(site)
+
+		err = (&configurationSource{}).Write(ctx, raw)
+		if err != nil {
+			return errors.Wrap(err, "writing site config overrides to database")
+		}
+		return nil
+	}
+	err := updateFunc(ctx)
+	if err != nil {
+		return err
+	}
+
+	go watchUpdate(ctx, path, updateFunc)
+	return nil
+}
+
+func overrideGlobalSettings(ctx context.Context, db dbutil.DB) error {
+	path := os.Getenv("GLOBAL_SETTINGS_FILE")
+	if path == "" {
+		return nil
+	}
+	settings := database.Settings(db)
+	var update = func(ctx context.Context) error {
+		globalSettingsBytes, err := os.ReadFile(path)
+		if err != nil {
+			return errors.Wrap(err, "reading GLOBAL_SETTINGS_FILE")
+		}
+		currentSettings, err := settings.GetLatest(ctx, api.SettingsSubject{Site: true})
+		if err != nil {
+			return errors.Wrap(err, "could not fetch current settings")
+		}
+		// Only overwrite the settings if the current settings differ, don't exist, or were
+		// created by a human user to prevent creating unnecessary rows in the DB.
+		globalSettings := string(globalSettingsBytes)
+		if currentSettings == nil || currentSettings.AuthorUserID != nil || currentSettings.Contents != globalSettings {
+			var lastID *int32 = nil
+			if currentSettings != nil {
+				lastID = &currentSettings.ID
+			}
+			_, err = settings.CreateIfUpToDate(ctx, api.SettingsSubject{Site: true}, lastID, nil, globalSettings)
+			if err != nil {
+				return errors.Wrap(err, "writing global setting override to database")
+			}
+		}
+		return nil
+	}
+	if err := update(ctx); err != nil {
+		return err
+	}
+	go watchUpdate(ctx, path, update)
+
+	return nil
+}
+
+func overrideExtSvcConfig(ctx context.Context, db dbutil.DB) error {
+	log := log15.Root().New("svc", "config.file")
+	path := os.Getenv("EXTSVC_CONFIG_FILE")
+	if path == "" {
+		return nil
+	}
+	extsvcs := database.ExternalServices(db)
+
+	var update = func(ctx context.Context) error {
+		raw, err := (&configurationSource{}).Read(ctx)
+		if err != nil {
+			return err
+		}
+		parsed, err := conf.ParseConfig(raw)
+		if err != nil {
+			return errors.Wrap(err, "parsing extsvc config")
+		}
+		confGet := func() *conf.Unified { return parsed }
+
+		extsvcConfig, err := os.ReadFile(path)
+		if err != nil {
+			return errors.Wrap(err, "reading EXTSVC_CONFIG_FILE")
+		}
+		var rawConfigs map[string][]*json.RawMessage
+		if err := jsonc.Unmarshal(string(extsvcConfig), &rawConfigs); err != nil {
+			return errors.Wrap(err, "parsing EXTSVC_CONFIG_FILE")
+		}
+		if len(rawConfigs) == 0 {
+			log.Warn("EXTSVC_CONFIG_FILE contains zero external service configurations")
 		}
 
-		if overrideSiteConfig != "" {
-			site, err := ioutil.ReadFile(overrideSiteConfig)
-			if err != nil {
-				return errors.Wrap(err, "reading SITE_CONFIG_FILE")
-			}
-			raw.Site = string(site)
+		existing, err := extsvcs.List(ctx, database.ExternalServicesListOptions{
+			// NOTE: External services loaded from config file do not have namespace specified.
+			// Therefore, we only need to load those from database.
+			NoNamespace: true,
+		})
+		if err != nil {
+			return errors.Wrap(err, "ExternalServices.List")
 		}
 
-		if overrideSiteConfig != "" {
-			err := (&configurationSource{}).Write(ctx, raw)
-			if err != nil {
-				return errors.Wrap(err, "writing site config overrides to database")
-			}
+		// Perform delta update for external services. We don't want to just delete all
+		// external services and re-add all of them, because that would cause
+		// repo-updater to need to update repositories and reassociate them with external
+		// services each time the frontend restarts.
+		//
+		// Start out by assuming we will remove all and re-add all.
+		var (
+			toAdd    = make(map[*types.ExternalService]bool)
+			toRemove = make(map[*types.ExternalService]bool)
+			toUpdate = make(map[int64]*types.ExternalService)
+		)
+		for _, existing := range existing {
+			toRemove[existing] = true
 		}
-
-		if overrideGlobalSettings != "" {
-			globalSettingsBytes, err := ioutil.ReadFile(overrideGlobalSettings)
-			if err != nil {
-				return errors.Wrap(err, "reading GLOBAL_SETTINGS_FILE")
-			}
-			currentSettings, err := db.Settings.GetLatest(ctx, api.SettingsSubject{Site: true})
-			if err != nil {
-				return errors.Wrap(err, "could not fetch current settings")
-			}
-			// Only overwrite the settings if the current settings differ, don't exist, or were
-			// created by a human user to prevent creating unnecessary rows in the DB.
-			globalSettings := string(globalSettingsBytes)
-			if currentSettings == nil || currentSettings.AuthorUserID != nil || currentSettings.Contents != globalSettings {
-				var lastID *int32 = nil
-				if currentSettings != nil {
-					lastID = &currentSettings.ID
-				}
-				_, err = db.Settings.CreateIfUpToDate(ctx, api.SettingsSubject{Site: true}, lastID, nil, globalSettings)
+		for key, cfgs := range rawConfigs {
+			for i, cfg := range cfgs {
+				marshaledCfg, err := json.MarshalIndent(cfg, "", "  ")
 				if err != nil {
-					return errors.Wrap(err, "writing global setting override to database")
+					return errors.Wrap(err, fmt.Sprintf("marshaling extsvc config ([%v][%v])", key, i))
+				}
+
+				// When overriding external service config from a file we allow setting the value
+				// of the cloud_default column.
+				var cloudDefault bool
+				switch key {
+				case extsvc.KindGitHub:
+					var c schema.GitHubConnection
+					if err = json.Unmarshal(marshaledCfg, &c); err != nil {
+						return err
+					}
+					cloudDefault = c.CloudDefault
+
+				case extsvc.KindGitLab:
+					var c schema.GitLabConnection
+					if err = json.Unmarshal(marshaledCfg, &c); err != nil {
+						return err
+					}
+					cloudDefault = c.CloudDefault
+
+				}
+
+				toAdd[&types.ExternalService{
+					Kind:         key,
+					DisplayName:  fmt.Sprintf("%s #%d", key, i+1),
+					Config:       string(marshaledCfg),
+					CloudDefault: cloudDefault,
+				}] = true
+			}
+		}
+		// Now eliminate operations from toAdd/toRemove where the config
+		// file and DB describe an equivalent external service.
+		isEquiv := func(a, b *types.ExternalService) bool {
+			return a.Kind == b.Kind && a.DisplayName == b.DisplayName && a.Config == b.Config
+		}
+		shouldUpdate := func(a, b *types.ExternalService) bool {
+			return a.Kind == b.Kind && a.DisplayName == b.DisplayName && a.Config != b.Config
+		}
+		for a := range toAdd {
+			for b := range toRemove {
+				if isEquiv(a, b) { // Nothing changed
+					delete(toAdd, a)
+					delete(toRemove, b)
+				} else if shouldUpdate(a, b) {
+					delete(toAdd, a)
+					delete(toRemove, b)
+					toUpdate[b.ID] = a
 				}
 			}
 		}
 
-		if overrideExtSvcConfig != "" {
-			parsed, err := conf.ParseConfig(raw)
+		// Apply the delta update.
+		for extSvc := range toRemove {
+			log.Debug("Deleting external service", "id", extSvc.ID, "displayName", extSvc.DisplayName)
+			err := extsvcs.Delete(ctx, extSvc.ID)
 			if err != nil {
-				return errors.Wrap(err, "parsing extsvc config")
+				return errors.Wrap(err, "ExternalServices.Delete")
 			}
-			confGet := func() *conf.Unified { return parsed }
+		}
+		for extSvc := range toAdd {
+			log.Debug("Adding external service", "displayName", extSvc.DisplayName)
+			if err := extsvcs.Create(ctx, confGet, extSvc); err != nil {
+				return errors.Wrap(err, "ExternalServices.Create")
+			}
+		}
 
-			extsvc, err := ioutil.ReadFile(overrideExtSvcConfig)
-			if err != nil {
-				return errors.Wrap(err, "reading EXTSVC_CONFIG_FILE")
-			}
-			var rawConfigs map[string][]*json.RawMessage
-			if err := jsonc.Unmarshal(string(extsvc), &rawConfigs); err != nil {
-				return errors.Wrap(err, "parsing EXTSVC_CONFIG_FILE")
-			}
-			if len(rawConfigs) == 0 {
-				log15.Warn("EXTSVC_CONFIG_FILE contains zero external service configurations")
-			}
+		ps := confGet().AuthProviders
+		for id, extSvc := range toUpdate {
+			log.Debug("Updating external service", "id", id, "displayName", extSvc.DisplayName)
 
-			existing, err := db.ExternalServices.List(ctx, db.ExternalServicesListOptions{})
-			if err != nil {
-				return errors.Wrap(err, "ExternalServices.List")
+			update := &database.ExternalServiceUpdate{DisplayName: &extSvc.DisplayName, Config: &extSvc.Config, CloudDefault: &extSvc.CloudDefault}
+			if err := extsvcs.Update(ctx, ps, id, update); err != nil {
+				return errors.Wrap(err, "ExternalServices.Update")
 			}
+		}
+		return nil
+	}
+	if err := update(ctx); err != nil {
+		return err
+	}
 
-			// Perform delta update for external services. We don't want to
-			// just delete all external services and re-add all of them,
-			// because that would cause repo-updater to need to update
-			// repositories and reassociate them with external services each
-			// time the frontend restarts.
-			//
-			// Start out by assuming we will remove all and re-add all.
-			var (
-				toAdd    = make(map[*types.ExternalService]bool)
-				toRemove = make(map[*types.ExternalService]bool)
-				toUpdate = make(map[int64]*types.ExternalService)
-			)
-			for _, existing := range existing {
-				toRemove[existing] = true
-			}
-			for key, cfgs := range rawConfigs {
-				for i, cfg := range cfgs {
-					marshaledCfg, err := json.MarshalIndent(cfg, "", "  ")
-					if err != nil {
-						return errors.Wrap(err, fmt.Sprintf("marshaling extsvc config ([%v][%v])", key, i))
-					}
-					toAdd[&types.ExternalService{
-						Kind:        key,
-						DisplayName: fmt.Sprintf("%s #%d", key, i+1),
-						Config:      string(marshaledCfg),
-					}] = true
-				}
-			}
-			// Now eliminate operations from toAdd/toRemove where the config
-			// file and DB describe an equivalent external service.
-			isEquiv := func(a, b *types.ExternalService) bool {
-				return a.Kind == b.Kind && a.DisplayName == b.DisplayName && a.Config == b.Config
-			}
-			shouldUpdate := func(a, b *types.ExternalService) bool {
-				return a.Kind == b.Kind && a.DisplayName == b.DisplayName && a.Config != b.Config
-			}
-			for a := range toAdd {
-				for b := range toRemove {
-					if isEquiv(a, b) { // Nothing changed
-						delete(toAdd, a)
-						delete(toRemove, b)
-					} else if shouldUpdate(a, b) {
-						delete(toAdd, a)
-						delete(toRemove, b)
-						toUpdate[b.ID] = a
-					}
-				}
-			}
+	go watchUpdate(ctx, path, update)
 
-			// Apply the delta update.
-			for extSvc := range toRemove {
-				log15.Debug("Deleting external service", "id", extSvc.ID, "displayName", extSvc.DisplayName)
-				err := db.ExternalServices.Delete(ctx, extSvc.ID)
-				if err != nil {
-					return errors.Wrap(err, "ExternalServices.Delete")
-				}
-			}
-			for extSvc := range toAdd {
-				log15.Debug("Adding external service", "displayName", extSvc.DisplayName)
-				if err := db.ExternalServices.Create(ctx, confGet, extSvc); err != nil {
-					return errors.Wrap(err, "ExternalServices.Create")
-				}
-			}
+	return nil
+}
 
-			ps := confGet().AuthProviders
-			for id, extSvc := range toUpdate {
-				log15.Debug("Updating external service", "id", id, "displayName", extSvc.DisplayName)
+func watchUpdate(ctx context.Context, path string, update func(context.Context) error) {
+	log := log15.Root().New("svc", "config.file")
+	events, err := watchPaths(ctx, path)
+	if err != nil {
+		log.Error("failed to watch config override files", "error", err)
+		return
+	}
+	for err := range events {
+		if err != nil {
+			log.Warn("error while watching config override files", "error", err)
+			metricConfigOverrideUpdates.WithLabelValues("watch_failed").Inc()
+			continue
+		}
 
-				update := &db.ExternalServiceUpdate{DisplayName: &extSvc.DisplayName, Config: &extSvc.Config}
-				if err := db.ExternalServices.Update(ctx, ps, id, update); err != nil {
-					return errors.Wrap(err, "ExternalServices.Update")
-				}
-			}
+		if err := update(ctx); err != nil {
+			log.Error("failed to update configuration from modified config override file", "error", err, "file", path)
+			metricConfigOverrideUpdates.WithLabelValues("update_failed").Inc()
+		} else {
+			log.Info("updated configuration from modified config override files", "file", path)
+			metricConfigOverrideUpdates.WithLabelValues("success").Inc()
 		}
 	}
-	return nil
+}
+
+// watchPaths returns a channel which watches the non-empty paths. Whenever
+// any path changes a nil error is sent down chan. If an error occurs it is
+// sent. chan is closed when ctx is Done.
+//
+// Note: This can send many events even if the file content hasn't
+// changed. For example chmod events are sent. Another is a rename is two
+// events for watcher (remove and create). Additionally if a file is removed
+// the watch is removed. Even if a file with the same name is created in its
+// place later.
+func watchPaths(ctx context.Context, paths ...string) (<-chan error, error) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, p := range paths {
+		// as a convenience ignore empty paths
+		if p == "" {
+			continue
+		}
+		if err := watcher.Add(p); err != nil {
+			return nil, err
+		}
+	}
+
+	out := make(chan error)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				err := watcher.Close()
+				if err != nil {
+					out <- err
+				}
+				close(out)
+				return
+
+			case <-watcher.Events:
+				out <- nil
+
+			case err := <-watcher.Errors:
+				out <- err
+
+			}
+		}
+	}()
+
+	return out, nil
 }
 
 type configurationSource struct{}
@@ -241,10 +381,23 @@ func serviceConnections() conftypes.ServiceConnections {
 		}
 
 		serviceConnectionsVal = conftypes.ServiceConnections{
-			GitServers:  gitServers(),
-			PostgresDSN: dbutil.PostgresDSN(username, os.Getenv),
+			GitServers:               gitServers(),
+			PostgresDSN:              dbutil.PostgresDSN("", username, os.Getenv),
+			CodeIntelPostgresDSN:     dbutil.PostgresDSN("codeintel", username, os.Getenv),
+			CodeInsightsTimescaleDSN: dbutil.PostgresDSN("codeinsights", username, os.Getenv),
+		}
+
+		// We set this envvar in development to disable the following check
+		if os.Getenv("CODEINTEL_PG_ALLOW_SINGLE_DB") != "" {
+			return
+		}
+
+		// Ensure that the code intelligence database is not pointing at the frontend database
+		if err := comparePostgresDSNs(serviceConnectionsVal.PostgresDSN, serviceConnectionsVal.CodeIntelPostgresDSN); err != nil {
+			panic(err.Error())
 		}
 	})
+
 	return serviceConnectionsVal
 }
 
@@ -258,4 +411,30 @@ func gitServers() []string {
 		}
 	}
 	return strings.Fields(v)
+}
+
+// comparePostgresDSNs returns an error if one of the given Postgres DSN values are
+// not a valid URL, or if they are both valid URLs but point to the same database.
+// We consider two DSNs to be the same when they specify the same host, port, and
+// path. It's possible that different hosts/ports map to the same physical machine,
+// so we could conceivably return false negatives here and the tricksy site-admin
+// may have pulled the wool over our eyes. This shouldn't actually affect anything
+// operationally in the near-term, but may just make migrations harder when we need
+// to have them manually separate the data.
+func comparePostgresDSNs(dsn1, dsn2 string) error {
+	url1, err := url.Parse(dsn1)
+	if err != nil {
+		return errors.Errorf("illegal Postgres DSN: %s", dsn1)
+	}
+
+	url2, err := url.Parse(dsn2)
+	if err != nil {
+		return errors.Errorf("illegal Postgres DSN: %s", dsn2)
+	}
+
+	if url1.Host == url2.Host && url1.Path == url2.Path {
+		return errors.Errorf("codeintel and frontend databases must be distinct: %s and %s seem to refer to the same database", dsn1, dsn2)
+	}
+
+	return nil
 }

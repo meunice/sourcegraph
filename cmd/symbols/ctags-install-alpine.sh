@@ -5,10 +5,9 @@
 set -eux
 
 # Commit hash of github.com/universal-ctags/ctags
-CTAGS_VERSION=03f933a96d3ef87adbf9d167462d45ce69577edb
+CTAGS_VERSION=681a8d5f5f6fcca9d8cca703c250f4cdf05b45c3
 
 apk --no-cache add \
-  --virtual build-deps \
   autoconf \
   automake \
   binutils \
@@ -17,6 +16,8 @@ apk --no-cache add \
   gcc \
   jansson-dev \
   libseccomp-dev \
+  jansson \
+  libseccomp \
   linux-headers \
   make \
   pkgconfig
@@ -25,11 +26,10 @@ apk --no-cache add \
 curl "https://codeload.github.com/universal-ctags/ctags/tar.gz/$CTAGS_VERSION" | tar xz -C /tmp
 cd /tmp/ctags-$CTAGS_VERSION
 ./autogen.sh
-LDFLAGS=-static ./configure --program-prefix=universal- --enable-json --enable-seccomp
+./configure --program-prefix=universal- --enable-json --enable-seccomp
 make -j8
 make install
 
 # Cleanup
 cd /
 rm -rf /tmp/ctags-$CTAGS_VERSION
-apk --no-cache --purge del build-deps

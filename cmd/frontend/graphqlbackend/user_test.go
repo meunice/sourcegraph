@@ -2,18 +2,19 @@ package graphqlbackend
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strconv"
 	"testing"
 
+	"github.com/cockroachdb/errors"
 	gqlerrors "github.com/graph-gophers/graphql-go/errors"
-	"github.com/graph-gophers/graphql-go/gqltesting"
+
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/envvar"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/types"
 	"github.com/sourcegraph/sourcegraph/internal/actor"
 	"github.com/sourcegraph/sourcegraph/internal/conf"
-	"github.com/sourcegraph/sourcegraph/internal/db"
+	"github.com/sourcegraph/sourcegraph/internal/database"
+	"github.com/sourcegraph/sourcegraph/internal/database/dbtesting"
+	"github.com/sourcegraph/sourcegraph/internal/types"
 	"github.com/sourcegraph/sourcegraph/schema"
 )
 
@@ -21,7 +22,7 @@ func TestUser(t *testing.T) {
 	t.Run("by username", func(t *testing.T) {
 		checkUserByUsername := func(t *testing.T) {
 			t.Helper()
-			gqltesting.RunTests(t, []*gqltesting.Test{
+			RunTests(t, []*Test{
 				{
 					Schema: mustParseGraphQLSchema(t),
 					Query: `
@@ -43,7 +44,7 @@ func TestUser(t *testing.T) {
 		}
 
 		resetMocks()
-		db.Mocks.Users.GetByUsername = func(_ context.Context, username string) (*types.User, error) {
+		database.Mocks.Users.GetByUsername = func(_ context.Context, username string) (*types.User, error) {
 			if want := "alice"; username != want {
 				t.Errorf("got %q, want %q", username, want)
 			}
@@ -65,7 +66,7 @@ func TestUser(t *testing.T) {
 
 	t.Run("by email", func(t *testing.T) {
 		resetMocks()
-		db.Mocks.Users.GetByVerifiedEmail = func(_ context.Context, email string) (*types.User, error) {
+		database.Mocks.Users.GetByVerifiedEmail = func(_ context.Context, email string) (*types.User, error) {
 			if want := "alice@example.com"; email != want {
 				t.Errorf("got %q, want %q", email, want)
 			}
@@ -75,7 +76,7 @@ func TestUser(t *testing.T) {
 		t.Run("disallowed on Sourcegraph.com", func(t *testing.T) {
 			checkUserByEmailError := func(t *testing.T, wantErr string) {
 				t.Helper()
-				gqltesting.RunTests(t, []*gqltesting.Test{
+				RunTests(t, []*Test{
 					{
 						Schema: mustParseGraphQLSchema(t),
 						Query: `
@@ -86,7 +87,13 @@ func TestUser(t *testing.T) {
 				}
 			`,
 						ExpectedResult: `{"user": null}`,
-						ExpectedErrors: []*gqlerrors.QueryError{{Message: wantErr, Path: []interface{}{"user"}, ResolverError: errors.New(wantErr)}},
+						ExpectedErrors: []*gqlerrors.QueryError{
+							{
+								Path:          []interface{}{"user"},
+								Message:       wantErr,
+								ResolverError: errors.New(wantErr),
+							},
+						},
 					},
 				})
 			}
@@ -96,13 +103,13 @@ func TestUser(t *testing.T) {
 			defer envvar.MockSourcegraphDotComMode(orig) // reset
 
 			t.Run("for anonymous viewer", func(t *testing.T) {
-				db.Mocks.Users.GetByCurrentAuthUser = func(context.Context) (*types.User, error) {
-					return nil, db.ErrNoCurrentUser
+				database.Mocks.Users.GetByCurrentAuthUser = func(context.Context) (*types.User, error) {
+					return nil, database.ErrNoCurrentUser
 				}
 				checkUserByEmailError(t, "not authenticated")
 			})
 			t.Run("for non-site-admin viewer", func(t *testing.T) {
-				db.Mocks.Users.GetByCurrentAuthUser = func(context.Context) (*types.User, error) {
+				database.Mocks.Users.GetByCurrentAuthUser = func(context.Context) (*types.User, error) {
 					return &types.User{SiteAdmin: false}, nil
 				}
 				checkUserByEmailError(t, "must be site admin")
@@ -110,7 +117,7 @@ func TestUser(t *testing.T) {
 		})
 
 		t.Run("allowed on non-Sourcegraph.com", func(t *testing.T) {
-			gqltesting.RunTests(t, []*gqltesting.Test{
+			RunTests(t, []*Test{
 				{
 					Schema: mustParseGraphQLSchema(t),
 					Query: `
@@ -135,9 +142,9 @@ func TestUser(t *testing.T) {
 
 func TestNode_User(t *testing.T) {
 	resetMocks()
-	db.Mocks.Users.MockGetByID_Return(t, &types.User{ID: 1, Username: "alice"}, nil)
+	database.Mocks.Users.MockGetByID_Return(t, &types.User{ID: 1, Username: "alice"}, nil)
 
-	gqltesting.RunTests(t, []*gqltesting.Test{
+	RunTests(t, []*Test{
 		{
 			Schema: mustParseGraphQLSchema(t),
 			Query: `
@@ -163,18 +170,20 @@ func TestNode_User(t *testing.T) {
 }
 
 func TestUpdateUser(t *testing.T) {
+	db := new(dbtesting.MockDB)
+
 	t.Run("not site admin nor the same user", func(t *testing.T) {
-		db.Mocks.Users.GetByID = func(ctx context.Context, id int32) (*types.User, error) {
+		database.Mocks.Users.GetByID = func(ctx context.Context, id int32) (*types.User, error) {
 			return &types.User{ID: id, Username: strconv.Itoa(int(id))}, nil
 		}
-		db.Mocks.Users.GetByCurrentAuthUser = func(context.Context) (*types.User, error) {
+		database.Mocks.Users.GetByCurrentAuthUser = func(context.Context) (*types.User, error) {
 			return &types.User{ID: 2, Username: "2", SiteAdmin: false}, nil
 		}
 		t.Cleanup(func() {
-			db.Mocks.Users = db.MockUsers{}
+			database.Mocks.Users = database.MockUsers{}
 		})
 
-		result, err := (&schemaResolver{}).UpdateUser(context.Background(), &updateUserArgs{User: "VXNlcjox"})
+		result, err := (&schemaResolver{db: db}).UpdateUser(context.Background(), &updateUserArgs{User: "VXNlcjox"})
 		wantErr := "must be authenticated as 1 or as an admin (must be site admin)"
 		gotErr := fmt.Sprintf("%v", err)
 		if wantErr != gotErr {
@@ -188,15 +197,15 @@ func TestUpdateUser(t *testing.T) {
 	t.Run("disallow suspicious names", func(t *testing.T) {
 		oldSourcegraphDotComMode := envvar.SourcegraphDotComMode()
 		envvar.MockSourcegraphDotComMode(true)
-		db.Mocks.Users.GetByCurrentAuthUser = func(context.Context) (*types.User, error) {
+		database.Mocks.Users.GetByCurrentAuthUser = func(context.Context) (*types.User, error) {
 			return &types.User{SiteAdmin: true}, nil
 		}
 		t.Cleanup(func() {
 			envvar.MockSourcegraphDotComMode(oldSourcegraphDotComMode)
-			db.Mocks.Users = db.MockUsers{}
+			database.Mocks.Users = database.MockUsers{}
 		})
 
-		result, err := (&schemaResolver{}).UpdateUser(context.Background(), &updateUserArgs{
+		result, err := (&schemaResolver{db: db}).UpdateUser(context.Background(), &updateUserArgs{
 			User:     "VXNlcjox",
 			Username: strptr("about"),
 		})
@@ -216,19 +225,19 @@ func TestUpdateUser(t *testing.T) {
 				AuthEnableUsernameChanges: false,
 			},
 		})
-		db.Mocks.Users.GetByID = func(ctx context.Context, id int32) (*types.User, error) {
+		database.Mocks.Users.GetByID = func(ctx context.Context, id int32) (*types.User, error) {
 			return &types.User{ID: id}, nil
 		}
-		db.Mocks.Users.GetByCurrentAuthUser = func(context.Context) (*types.User, error) {
+		database.Mocks.Users.GetByCurrentAuthUser = func(context.Context) (*types.User, error) {
 			return &types.User{ID: 1, SiteAdmin: false}, nil
 		}
 		t.Cleanup(func() {
 			conf.Mock(nil)
-			db.Mocks.Users = db.MockUsers{}
+			database.Mocks.Users = database.MockUsers{}
 		})
 
 		ctx := actor.WithActor(context.Background(), &actor.Actor{UID: 1})
-		result, err := (&schemaResolver{}).UpdateUser(ctx, &updateUserArgs{
+		result, err := (&schemaResolver{db: db}).UpdateUser(ctx, &updateUserArgs{
 			User:     "VXNlcjox",
 			Username: strptr("alice"),
 		})
@@ -242,36 +251,88 @@ func TestUpdateUser(t *testing.T) {
 		}
 	})
 
-	db.Mocks.Users.GetByCurrentAuthUser = func(context.Context) (*types.User, error) {
-		return &types.User{SiteAdmin: true}, nil
-	}
-	db.Mocks.Users.Update = func(userID int32, update db.UserUpdate) error {
-		return nil
-	}
-	t.Cleanup(func() {
-		db.Mocks.Users = db.MockUsers{}
+	t.Run("non site admin can change non-username fields", func(t *testing.T) {
+		conf.Mock(&conf.Unified{
+			SiteConfiguration: schema.SiteConfiguration{
+				AuthEnableUsernameChanges: false,
+			},
+		})
+		database.Mocks.Users.GetByID = func(ctx context.Context, id int32) (*types.User, error) {
+			return &types.User{ID: 1, Username: "alice", DisplayName: "alice-updated", AvatarURL: "http://www.example.com/alice-updated", SiteAdmin: false}, nil
+		}
+		database.Mocks.Users.GetByCurrentAuthUser = func(context.Context) (*types.User, error) {
+			return &types.User{ID: 1, Username: "alice", DisplayName: "alice-updated", AvatarURL: "http://www.example.com/alice-updated", SiteAdmin: false}, nil
+		}
+		database.Mocks.Users.Update = func(userID int32, update database.UserUpdate) error {
+			return nil
+		}
+		t.Cleanup(func() {
+			database.Mocks.Users = database.MockUsers{}
+		})
+
+		RunTests(t, []*Test{
+			{
+				Context: actor.WithActor(context.Background(), &actor.Actor{UID: 1}),
+				Schema:  mustParseGraphQLSchema(t),
+				Query: `
+			mutation {
+				updateUser(
+					user: "VXNlcjox",
+					displayName: "alice-updated"
+					avatarURL: "http://www.example.com/alice-updated"
+				) {
+					displayName,
+					avatarURL
+				}
+			}
+		`,
+				ExpectedResult: `
+			{
+				"updateUser": {
+					"displayName": "alice-updated",
+					"avatarURL": "http://www.example.com/alice-updated"
+				}
+			}
+		`,
+			},
+		})
 	})
 
-	gqltesting.RunTests(t, []*gqltesting.Test{
-		{
-			Schema: mustParseGraphQLSchema(t),
-			Query: `
+	t.Run("success", func(t *testing.T) {
+		database.Mocks.Users.GetByID = func(ctx context.Context, id int32) (*types.User, error) {
+			return &types.User{ID: id, Username: strconv.Itoa(int(id))}, nil
+		}
+		database.Mocks.Users.GetByCurrentAuthUser = func(context.Context) (*types.User, error) {
+			return &types.User{SiteAdmin: true}, nil
+		}
+		database.Mocks.Users.Update = func(userID int32, update database.UserUpdate) error {
+			return nil
+		}
+		t.Cleanup(func() {
+			database.Mocks.Users = database.MockUsers{}
+		})
+
+		RunTests(t, []*Test{
+			{
+				Schema: mustParseGraphQLSchema(t),
+				Query: `
 			mutation {
 				updateUser(
 					user: "VXNlcjox",
 					username: "alice.bob-chris-"
 				) {
-					alwaysNil
+					username
 				}
 			}
 		`,
-			ExpectedResult: `
+				ExpectedResult: `
 			{
 				"updateUser": {
-					"alwaysNil": null
+					"username": "1"
 				}
 			}
 		`,
-		},
+			},
+		})
 	})
 }

@@ -7,9 +7,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 type ID int64
@@ -24,21 +25,23 @@ const (
 )
 
 type MergeRequest struct {
-	ID           ID                `json:"id"`
-	IID          ID                `json:"iid"`
-	ProjectID    ID                `json:"project_id"`
-	Title        string            `json:"title"`
-	Description  string            `json:"description"`
-	State        MergeRequestState `json:"state"`
-	CreatedAt    time.Time         `json:"created_at"`
-	UpdatedAt    time.Time         `json:"updated_at"`
-	MergedAt     *time.Time        `json:"merged_at"`
-	ClosedAt     *time.Time        `json:"closed_at"`
-	HeadPipeline *Pipeline         `json:"head_pipeline"`
-	Labels       []string          `json:"labels"`
-	SourceBranch string            `json:"source_branch"`
-	TargetBranch string            `json:"target_branch"`
-	WebURL       string            `json:"web_url"`
+	ID             ID                `json:"id"`
+	IID            ID                `json:"iid"`
+	ProjectID      ID                `json:"project_id"`
+	Title          string            `json:"title"`
+	Description    string            `json:"description"`
+	State          MergeRequestState `json:"state"`
+	CreatedAt      Time              `json:"created_at"`
+	UpdatedAt      Time              `json:"updated_at"`
+	MergedAt       *Time             `json:"merged_at"`
+	ClosedAt       *Time             `json:"closed_at"`
+	HeadPipeline   *Pipeline         `json:"head_pipeline"`
+	Labels         []string          `json:"labels"`
+	SourceBranch   string            `json:"source_branch"`
+	TargetBranch   string            `json:"target_branch"`
+	WebURL         string            `json:"web_url"`
+	WorkInProgress bool              `json:"work_in_progress"`
+	Author         User              `json:"author"`
 
 	DiffRefs DiffRefs `json:"diff_refs"`
 
@@ -46,8 +49,28 @@ type MergeRequest struct {
 	// Merge Request. Once our minimum version is GitLab 12.0, we can use the
 	// GraphQL API to retrieve all of this data at once, but until then, we have
 	// to do it the old fashioned way with lots of REST requests.
-	Notes     []*Note
-	Pipelines []*Pipeline
+	Notes               []*Note
+	Pipelines           []*Pipeline
+	ResourceStateEvents []*ResourceStateEvent
+}
+
+// IsWIP returns true if the given title would result in GitLab rendering the MR as 'work in progress'.
+func IsWIP(title string) bool {
+	return strings.HasPrefix(title, "Draft:") || strings.HasPrefix(title, "WIP:")
+}
+
+// SetWIP ensures a "WIP:" prefix on the given title. If a "Draft:" prefix is found, that one is retained instead.
+func SetWIP(title string) string {
+	if IsWIP(title) {
+		return title
+	}
+	return "WIP: " + title
+}
+
+// UnsetWIP removes "WIP:" and "Draft:" prefixes from the given title.
+// Depending on the GitLab version, either of them are used so we need to strip them both.
+func UnsetWIP(title string) string {
+	return strings.TrimPrefix(strings.TrimPrefix(title, "WIP: "), "Draft: ")
 }
 
 type DiffRefs struct {
@@ -58,7 +81,6 @@ type DiffRefs struct {
 
 var (
 	ErrMergeRequestAlreadyExists = errors.New("merge request already exists")
-	ErrMergeRequestNotFound      = errors.New("merge request not found")
 	ErrTooManyMergeRequests      = errors.New("retrieved too many merge requests")
 )
 
@@ -80,6 +102,8 @@ func (c *Client) CreateMergeRequest(ctx context.Context, project *Project, opts 
 	if err != nil {
 		return nil, errors.Wrap(err, "marshalling options")
 	}
+
+	time.Sleep(c.rateLimitMonitor.RecommendedWaitForBackgroundOp(1))
 
 	req, err := http.NewRequest("POST", fmt.Sprintf("projects/%d/merge_requests", project.ID), bytes.NewBuffer(data))
 	if err != nil {
@@ -103,6 +127,8 @@ func (c *Client) GetMergeRequest(ctx context.Context, project *Project, iid ID) 
 		return MockGetMergeRequest(c, ctx, project, iid)
 	}
 
+	time.Sleep(c.rateLimitMonitor.RecommendedWaitForBackgroundOp(1))
+
 	req, err := http.NewRequest("GET", fmt.Sprintf("projects/%d/merge_requests/%d", project.ID, iid), nil)
 	if err != nil {
 		return nil, errors.Wrap(err, "creating request to get a merge request")
@@ -110,6 +136,14 @@ func (c *Client) GetMergeRequest(ctx context.Context, project *Project, iid ID) 
 
 	resp := &MergeRequest{}
 	if _, _, err := c.do(ctx, req, resp); err != nil {
+		var e HTTPError
+		if errors.As(err, &e) && e.Code() == http.StatusNotFound {
+			if strings.Contains(e.Message(), "Project Not Found") {
+				err = ErrProjectNotFound
+			} else {
+				err = ErrMergeRequestNotFound
+			}
+		}
 		return nil, errors.Wrap(err, "sending request to get a merge request")
 	}
 
@@ -138,6 +172,8 @@ func (c *Client) GetOpenMergeRequestByRefs(ctx context.Context, project *Project
 	u := &url.URL{
 		Path: fmt.Sprintf("projects/%d/merge_requests", project.ID), RawQuery: values.Encode(),
 	}
+
+	time.Sleep(c.rateLimitMonitor.RecommendedWaitForBackgroundOp(1))
 
 	req, err := http.NewRequest("GET", u.String(), nil)
 	if err != nil {
@@ -190,6 +226,8 @@ func (c *Client) UpdateMergeRequest(ctx context.Context, project *Project, mr *M
 		return nil, errors.Wrap(err, "marshalling options")
 	}
 
+	time.Sleep(c.rateLimitMonitor.RecommendedWaitForBackgroundOp(1))
+
 	req, err := http.NewRequest("PUT", fmt.Sprintf("projects/%d/merge_requests/%d", project.ID, mr.IID), bytes.NewBuffer(data))
 	if err != nil {
 		return nil, errors.Wrap(err, "creating request to update a merge request")
@@ -201,4 +239,78 @@ func (c *Client) UpdateMergeRequest(ctx context.Context, project *Project, mr *M
 	}
 
 	return resp, nil
+}
+
+// ErrNotMergeable is returned by MergeMergeRequest when the merge request cannot
+// be merged, because a precondition isn't met.
+var ErrNotMergeable = errors.New("merge request is not in a mergeable state")
+
+func (c *Client) MergeMergeRequest(ctx context.Context, project *Project, mr *MergeRequest, squash bool) (*MergeRequest, error) {
+	if MockMergeMergeRequest != nil {
+		return MockMergeMergeRequest(c, ctx, project, mr, squash)
+	}
+
+	payload := struct {
+		Squash              bool   `json:"squash,omitempty"`
+		SquashCommitMessage string `json:"squash_commit_message,omitempty"`
+	}{
+		Squash: squash,
+	}
+	if squash {
+		payload.SquashCommitMessage = mr.Title + "\n\n" + mr.Description
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return nil, errors.Wrap(err, "marshalling options")
+	}
+
+	time.Sleep(c.rateLimitMonitor.RecommendedWaitForBackgroundOp(1))
+
+	req, err := http.NewRequest("PUT", fmt.Sprintf("projects/%d/merge_requests/%d/merge", project.ID, mr.IID), bytes.NewBuffer(data))
+	if err != nil {
+		return nil, errors.Wrap(err, "creating request to merge a merge request")
+	}
+
+	resp := &MergeRequest{}
+	if _, _, err := c.do(ctx, req, resp); err != nil {
+		var e HTTPError
+		if errors.As(err, &e) && e.Code() == http.StatusMethodNotAllowed {
+			return nil, errors.Wrap(ErrNotMergeable, err.Error())
+		}
+		return nil, errors.Wrap(err, "sending request to merge a merge request")
+	}
+
+	return resp, nil
+}
+
+func (c *Client) CreateMergeRequestNote(ctx context.Context, project *Project, mr *MergeRequest, body string) error {
+	if MockCreateMergeRequestNote != nil {
+		return MockCreateMergeRequestNote(c, ctx, project, mr, body)
+	}
+
+	var payload = struct {
+		Body string `json:"body"`
+	}{
+		Body: body,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return errors.Wrap(err, "marshalling payload")
+	}
+
+	time.Sleep(c.rateLimitMonitor.RecommendedWaitForBackgroundOp(1))
+
+	req, err := http.NewRequest("POST", fmt.Sprintf("projects/%d/merge_requests/%d/notes", project.ID, mr.IID), bytes.NewBuffer(data))
+	if err != nil {
+		return errors.Wrap(err, "creating request to comment on a merge request")
+	}
+
+	var resp struct {
+		ID int32 `json:"id"`
+	}
+	if _, _, err := c.do(ctx, req, &resp); err != nil {
+		return errors.Wrap(err, "sending request to comment on a merge request")
+	}
+
+	return nil
 }

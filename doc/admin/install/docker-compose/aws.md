@@ -6,22 +6,17 @@ This tutorial shows you how to deploy Sourcegraph via [Docker Compose](https://d
 
 ---
 
-## (optional, recommended) Create a fork for customizations
-
-We **strongly** recommend that you create your own fork of [sourcegraph/deploy-sourcegraph-docker](https://github.com/sourcegraph/deploy-sourcegraph-docker/) to track customizations to the [Sourcegraph Docker Compose yaml](https://github.com/sourcegraph/deploy-sourcegraph-docker/blob/master/docker-compose/docker-compose.yaml). This will make upgrades far easier.
-
-See ["Store customizations in a fork"](./index.md#optional-recommended-store-customizations-in-a-fork) for full instructions.
-
 ## Deploy to EC2
 
 * Click **Launch Instance** from your [EC2 dashboard](https://console.aws.amazon.com/ec2/v2/home).
 * Select the **Amazon Linux 2 AMI (HVM), SSD Volume Type**.
 * Select an appropriate instance size (use the [resource estimator](../resource_estimator.md) to find a good starting point for your deployment), then **Next: Configure Instance Details.**
 * Ensure the **Auto-assign Public IP** option is "Enable". This ensures your instance is accessible to the Internet.
-* Add the following user data (as text) in the **Advanced Details** section:
-  * (optional) If you [created a fork as recommended above](#optional-recommended-create-a-fork-for-customizations), update the following environment variables in the script below:
-    * `DEPLOY_SOURCEGRAPH_DOCKER_FORK_CLONE_URL`: Your fork's git clone URL
-    * `DEPLOY_SOURCEGRAPH_DOCKER_FORK_REVISION`: The git revision containing your fork's customizations to the base Sourcegraph Docker Compose yaml. Most likely, `DEPLOY_SOURCEGRAPH_DOCKER_FORK_REVISION='release'` if you followed our branching recommendations in ["Store customizations in a fork"](./index.md#optional-recommended-store-customizations-in-a-fork).
+
+> WARNING: To configure your Sourcegraph instance, you must create and use a fork of the reference repository - refer to [Configuring Sourcegraph with Docker Compose](./operations.md#configure) for more details. Then update the following variables in the script below:
+>
+> * `DEPLOY_SOURCEGRAPH_DOCKER_FORK_CLONE_URL`: Your fork's git clone URL
+> * `DEPLOY_SOURCEGRAPH_DOCKER_FORK_REVISION`: The git revision containing your fork's customizations to the base Sourcegraph Docker Compose YAML. Most likely, `DEPLOY_SOURCEGRAPH_DOCKER_FORK_REVISION='release'` if you followed our branching recommendations in the [Configuration guide](./operations.md#configure)
 
 ```bash
 #!/usr/bin/env bash
@@ -36,7 +31,7 @@ DEPLOY_SOURCEGRAPH_DOCKER_CHECKOUT='/home/ec2-user/deploy-sourcegraph-docker'
 
 # 🚨 Update these variables with the correct values from your fork!
 DEPLOY_SOURCEGRAPH_DOCKER_FORK_CLONE_URL='https://github.com/sourcegraph/deploy-sourcegraph-docker.git'
-DEPLOY_SOURCEGRAPH_DOCKER_FORK_REVISION='v3.17.2'
+DEPLOY_SOURCEGRAPH_DOCKER_FORK_REVISION='v3.30.1'
 
 # Install git
 yum update -y
@@ -89,9 +84,6 @@ trap "rm -f ${tmp_config}" EXIT
 cat "${DOCKER_DAEMON_CONFIG_FILE}" | jq --arg DATA_ROOT "${DOCKER_DATA_ROOT}" '.["data-root"]=$DATA_ROOT' > "${tmp_config}"
 cat "${tmp_config}" > "${DOCKER_DAEMON_CONFIG_FILE}"
 
-# Configure inotify limits for indexed search.
-echo -e "\nfs.inotify.max_user_watches = 128000\n" >> /etc/sysctl.d/local.conf
-
 ## finally, restart Docker daemon to pick up our changes
 systemctl restart --now docker
 
@@ -109,7 +101,7 @@ docker-compose up -d
 * Click "Add New Volume" and add an additional volume (for storing Docker data) with the following settings:
 
   * **Volume Type** (left-most column): EBS
-  * **IMPORTANT: Device**: `/dev/sdb` 
+  * **IMPORTANT: Device**: `/dev/sdb`
   * **Size (GiB)**: `250` GB minimum *(As a rule of thumb, Sourcegraph needs at least as much space as all your repositories combined take up. Allocating as much disk space as you can upfront helps you avoid [resizing your volume](https://aws.amazon.com/premiumsupport/knowledge-center/expand-root-ebs-linux/) later on.)*
   * **Volume Type**: General Purpose SSD (gp2)
   * **Delete on Termination**: Leave this setting unchecked
@@ -133,14 +125,13 @@ docker ps --filter="name=sourcegraph-frontend-0"
 
 ## Update your Sourcegraph version
 
-To update to the most recent version of Sourcegraph (X.Y.Z), SSH into your instance and run the following:
+To update to the most recent version of Sourcegraph (X.Y.Z), SSH into your instance:
 
 ```bash
 cd /home/ec2-user/deploy-sourcegraph-docker/docker-compose
-git pull
-git checkout vX.Y.Z
-docker-compose up -d
 ```
+
+And refer to the [Upgrade guide](./operations.md#upgrade).
 
 ---
 
@@ -151,11 +142,3 @@ The [Sourcegraph Docker Compose definition](https://github.com/sourcegraph/deplo
 * (**recommended**) The most straightfoward method to backup this data is to [snapshot the entire `/mnt/docker-data` EBS disk](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ebs-creating-snapshot.html) on an [automatic, scheduled basis](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/snapshot-lifecycle.html).
 
 * Using an external Postgres instance (see below) lets a service such as [AWS RDS for PostgreSQL](https://aws.amazon.com/rds/) take care of backing up all of Sourcegraph's user data for you. If the EC2 instance running Sourcegraph ever dies or is destroyed, creating a fresh instance that's connected to that external Postgres will leave Sourcegraph in the same state that it was before.
-
----
-
-## Using an external database for persistence
-
-The Docker Compose configuration has its own internal PostgreSQL and Redis databases. To preserve this data when you kill and recreate the containers, you can [use external databases](../../external_database.md) for persistence, such as [AWS RDS for PostgreSQL](https://aws.amazon.com/rds/) and [Amazon ElastiCache](https://aws.amazon.com/elasticache/redis/).
-
-> NOTE: Use of external databases requires [Sourcegraph Enterprise](https://about.sourcegraph.com/pricing).

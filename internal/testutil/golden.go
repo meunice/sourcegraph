@@ -2,7 +2,8 @@ package testutil
 
 import (
 	"encoding/json"
-	"io/ioutil"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -14,18 +15,21 @@ func AssertGolden(t testing.TB, path string, update bool, want interface{}) {
 	data := marshal(t, want)
 
 	if update {
-		if err := ioutil.WriteFile(path, data, 0640); err != nil {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatalf("failed to update golden file %q: %s", path, err)
+		}
+		if err := os.WriteFile(path, data, 0o640); err != nil {
 			t.Fatalf("failed to update golden file %q: %s", path, err)
 		}
 	}
 
-	golden, err := ioutil.ReadFile(path)
+	golden, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("failed to read golden file %q: %s", path, err)
 	}
 
 	if diff := cmp.Diff(string(golden), string(data)); diff != "" {
-		t.Error(diff)
+		t.Errorf("(-want, +got):\n%s", diff)
 	}
 }
 

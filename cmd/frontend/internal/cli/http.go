@@ -8,20 +8,26 @@ import (
 	gcontext "github.com/gorilla/context"
 	"github.com/gorilla/mux"
 	"github.com/graph-gophers/graphql-go"
+
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/auth"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/enterprise"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/globals"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/graphqlbackend"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/hooks"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/app"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/app/assetsutil"
 	internalauth "github.com/sourcegraph/sourcegraph/cmd/frontend/internal/auth"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/cli/middleware"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/handlerutil"
 	internalhttpapi "github.com/sourcegraph/sourcegraph/cmd/frontend/internal/httpapi"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/httpapi/router"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/pkg/handlerutil"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/session"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/webhooks"
 	"github.com/sourcegraph/sourcegraph/internal/actor"
 	"github.com/sourcegraph/sourcegraph/internal/conf"
+	"github.com/sourcegraph/sourcegraph/internal/database"
+	"github.com/sourcegraph/sourcegraph/internal/database/dbutil"
+	"github.com/sourcegraph/sourcegraph/internal/featureflag"
 	tracepkg "github.com/sourcegraph/sourcegraph/internal/trace"
 	"github.com/sourcegraph/sourcegraph/internal/trace/ot"
 	"github.com/sourcegraph/sourcegraph/internal/version"
@@ -29,41 +35,47 @@ import (
 
 // newExternalHTTPHandler creates and returns the HTTP handler that serves the app and API pages to
 // external clients.
-func newExternalHTTPHandler(schema *graphql.Schema, githubWebhook, bitbucketServerWebhook http.Handler, newCodeIntelUploadHandler enterprise.NewCodeIntelUploadHandler) (http.Handler, error) {
+func newExternalHTTPHandler(db dbutil.DB, schema *graphql.Schema, gitHubWebhook webhooks.Registerer, gitLabWebhook, bitbucketServerWebhook http.Handler, newCodeIntelUploadHandler enterprise.NewCodeIntelUploadHandler, newExecutorProxyHandler enterprise.NewExecutorProxyHandler, rateLimitWatcher graphqlbackend.LimitWatcher) (http.Handler, error) {
 	// Each auth middleware determines on a per-request basis whether it should be enabled (if not, it
 	// immediately delegates the request to the next middleware in the chain).
 	authMiddlewares := auth.AuthMiddleware()
 
 	// HTTP API handler, the call order of middleware is LIFO.
 	r := router.New(mux.NewRouter().PathPrefix("/.api/").Subrouter())
-	apiHandler := internalhttpapi.NewHandler(r, schema, githubWebhook, bitbucketServerWebhook, newCodeIntelUploadHandler)
+	apiHandler := internalhttpapi.NewHandler(db, r, schema, gitHubWebhook, gitLabWebhook, bitbucketServerWebhook, newCodeIntelUploadHandler, rateLimitWatcher)
 	if hooks.PostAuthMiddleware != nil {
 		// 🚨 SECURITY: These all run after the auth handler so the client is authenticated.
 		apiHandler = hooks.PostAuthMiddleware(apiHandler)
 	}
+	apiHandler = featureflag.Middleware(database.FeatureFlags(db), apiHandler)
 	apiHandler = authMiddlewares.API(apiHandler) // 🚨 SECURITY: auth middleware
 	// 🚨 SECURITY: The HTTP API should not accept cookies as authentication (except those with the
 	// X-Requested-With header). Doing so would open it up to CSRF attacks.
 	apiHandler = session.CookieMiddlewareWithCSRFSafety(apiHandler, corsAllowHeader, isTrustedOrigin) // API accepts cookies with special header
-	apiHandler = internalhttpapi.AccessTokenAuthMiddleware(apiHandler)                                // API accepts access tokens
+	apiHandler = internalhttpapi.AccessTokenAuthMiddleware(db, apiHandler)                            // API accepts access tokens
 	apiHandler = gziphandler.GzipHandler(apiHandler)
 
+	// 🚨 SECURITY: This handler implements its own token auth inside enterprise
+	executorProxyHandler := newExecutorProxyHandler()
+
 	// App handler (HTML pages), the call order of middleware is LIFO.
-	appHandler := app.NewHandler()
+	appHandler := app.NewHandler(db)
 	if hooks.PostAuthMiddleware != nil {
 		// 🚨 SECURITY: These all run after the auth handler so the client is authenticated.
 		appHandler = hooks.PostAuthMiddleware(appHandler)
 	}
+	appHandler = featureflag.Middleware(database.FeatureFlags(db), appHandler)
 	appHandler = handlerutil.CSRFMiddleware(appHandler, func() bool {
 		return globals.ExternalURL().Scheme == "https"
 	}) // after appAuthMiddleware because SAML IdP posts data to us w/o a CSRF token
-	appHandler = authMiddlewares.App(appHandler)                       // 🚨 SECURITY: auth middleware
-	appHandler = session.CookieMiddleware(appHandler)                  // app accepts cookies
-	appHandler = internalhttpapi.AccessTokenAuthMiddleware(appHandler) // app accepts access tokens
+	appHandler = authMiddlewares.App(appHandler)                           // 🚨 SECURITY: auth middleware
+	appHandler = session.CookieMiddleware(appHandler)                      // app accepts cookies
+	appHandler = internalhttpapi.AccessTokenAuthMiddleware(db, appHandler) // app accepts access tokens
 
 	// Mount handlers and assets.
 	sm := http.NewServeMux()
 	sm.Handle("/.api/", apiHandler)
+	sm.Handle("/.executors/", executorProxyHandler)
 	sm.Handle("/", appHandler)
 	assetsutil.Mount(sm)
 
@@ -75,7 +87,7 @@ func newExternalHTTPHandler(schema *graphql.Schema, githubWebhook, bitbucketServ
 	// OverrideAuthMiddleware allows us to inject an authentication token via an
 	// environment variable, for testing. This is true only when a site-config
 	// change is explicitly made, to enable this token.
-	h = internalauth.OverrideAuthMiddleware(h)
+	h = internalauth.OverrideAuthMiddleware(db, h)
 	h = internalauth.ForbidAllRequestsMiddleware(h)
 	h = tracepkg.HTTPTraceMiddleware(h)
 	h = ot.Middleware(h)
@@ -101,18 +113,23 @@ func healthCheckMiddleware(next http.Handler) http.Handler {
 
 // newInternalHTTPHandler creates and returns the HTTP handler for the internal API (accessible to
 // other internal services).
-func newInternalHTTPHandler(schema *graphql.Schema, newCodeIntelUploadHandler enterprise.NewCodeIntelUploadHandler) http.Handler {
+func newInternalHTTPHandler(schema *graphql.Schema, db dbutil.DB, newCodeIntelUploadHandler enterprise.NewCodeIntelUploadHandler, rateLimitWatcher graphqlbackend.LimitWatcher) http.Handler {
 	internalMux := http.NewServeMux()
 	internalMux.Handle("/.internal/", gziphandler.GzipHandler(
 		withInternalActor(
 			internalhttpapi.NewInternalHandler(
 				router.NewInternal(mux.NewRouter().PathPrefix("/.internal/").Subrouter()),
+				db,
 				schema,
 				newCodeIntelUploadHandler,
+				rateLimitWatcher,
 			),
 		),
 	))
-	return gcontext.ClearHandler(internalMux)
+	h := http.Handler(internalMux)
+	h = tracepkg.HTTPTraceMiddleware(h)
+	h = gcontext.ClearHandler(h)
+	return h
 }
 
 // withInternalActor wraps an existing HTTP handler by setting an internal actor in the HTTP request

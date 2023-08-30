@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io/fs"
 	"os"
 	stdlibpath "path"
 	"path/filepath"
@@ -14,8 +15,9 @@ import (
 
 	"gopkg.in/src-d/go-git.v4/plumbing/format/config"
 
+	"github.com/cockroachdb/errors"
 	"github.com/golang/groupcache/lru"
-	"github.com/pkg/errors"
+
 	"github.com/sourcegraph/sourcegraph/internal/api"
 	"github.com/sourcegraph/sourcegraph/internal/gitserver"
 	"github.com/sourcegraph/sourcegraph/internal/trace/ot"
@@ -24,7 +26,7 @@ import (
 
 // Lstat returns a FileInfo describing the named file at commit. If the file is a symbolic link, the
 // returned FileInfo describes the symbolic link.  Lstat makes no attempt to follow the link.
-func Lstat(ctx context.Context, repo gitserver.Repo, commit api.CommitID, path string) (os.FileInfo, error) {
+func Lstat(ctx context.Context, repo api.RepoName, commit api.CommitID, path string) (fs.FileInfo, error) {
 	span, ctx := ot.StartSpanFromContext(ctx, "Git: Lstat")
 	span.SetTag("Commit", commit)
 	span.SetTag("Path", path)
@@ -57,7 +59,7 @@ func Lstat(ctx context.Context, repo gitserver.Repo, commit api.CommitID, path s
 }
 
 // Stat returns a FileInfo describing the named file at commit.
-func Stat(ctx context.Context, repo gitserver.Repo, commit api.CommitID, path string) (os.FileInfo, error) {
+func Stat(ctx context.Context, repo api.RepoName, commit api.CommitID, path string) (fs.FileInfo, error) {
 	if Mocks.Stat != nil {
 		return Mocks.Stat(commit, path)
 	}
@@ -98,7 +100,7 @@ func Stat(ctx context.Context, repo gitserver.Repo, commit api.CommitID, path st
 }
 
 // ReadDir reads the contents of the named directory at commit.
-func ReadDir(ctx context.Context, repo gitserver.Repo, commit api.CommitID, path string, recurse bool) ([]os.FileInfo, error) {
+func ReadDir(ctx context.Context, repo api.RepoName, commit api.CommitID, path string, recurse bool) ([]fs.FileInfo, error) {
 	if Mocks.ReadDir != nil {
 		return Mocks.ReadDir(commit, path, recurse)
 	}
@@ -131,21 +133,41 @@ var (
 	lsTreeRootCache   = lru.New(5)
 )
 
+// LsFiles returns the output of `git ls-files`
+func LsFiles(ctx context.Context, repo api.RepoName, commit api.CommitID) ([]string, error) {
+	if Mocks.LsFiles != nil {
+		return Mocks.LsFiles(repo, commit)
+	}
+	args := []string{
+		"ls-files",
+		"-z",
+		"--with-tree",
+		string(commit),
+	}
+	cmd := gitserver.DefaultClient.Command("git", args...)
+	cmd.Repo = repo
+	out, err := cmd.CombinedOutput(ctx)
+	if err != nil {
+		return nil, errors.WithMessage(err, fmt.Sprintf("git command %v failed (output: %q)", cmd.Args, out))
+	}
+	return strings.Split(string(out), "\x00"), nil
+}
+
 // lsTree returns ls of tree at path.
-func lsTree(ctx context.Context, repo gitserver.Repo, commit api.CommitID, path string, recurse bool) ([]os.FileInfo, error) {
+func lsTree(ctx context.Context, repo api.RepoName, commit api.CommitID, path string, recurse bool) ([]fs.FileInfo, error) {
 	if path != "" || !recurse {
 		// Only cache the root recursive ls-tree.
 		return lsTreeUncached(ctx, repo, commit, path, recurse)
 	}
 
-	key := string(repo.Name) + ":" + string(commit) + ":" + path
+	key := string(repo) + ":" + string(commit) + ":" + path
 	lsTreeRootCacheMu.Lock()
 	v, ok := lsTreeRootCache.Get(key)
 	lsTreeRootCacheMu.Unlock()
-	var entries []os.FileInfo
+	var entries []fs.FileInfo
 	if ok {
 		// Cache hit.
-		entries = v.([]os.FileInfo)
+		entries = v.([]fs.FileInfo)
 	} else {
 		// Cache miss.
 		var err error
@@ -166,7 +188,7 @@ func lsTree(ctx context.Context, repo gitserver.Repo, commit api.CommitID, path 
 	return entries, nil
 }
 
-func lsTreeUncached(ctx context.Context, repo gitserver.Repo, commit api.CommitID, path string, recurse bool) ([]os.FileInfo, error) {
+func lsTreeUncached(ctx context.Context, repo api.RepoName, commit api.CommitID, path string, recurse bool) ([]fs.FileInfo, error) {
 	if err := ensureAbsoluteCommit(commit); err != nil {
 		return nil, err
 	}
@@ -204,14 +226,14 @@ func lsTreeUncached(ctx context.Context, repo gitserver.Repo, commit api.CommitI
 	if len(out) == 0 {
 		// If we are listing the empty root tree, we will have no output.
 		if stdlibpath.Clean(path) == "." {
-			return []os.FileInfo{}, nil
+			return []fs.FileInfo{}, nil
 		}
 		return nil, &os.PathError{Op: "git ls-tree", Path: path, Err: os.ErrNotExist}
 	}
 
 	trimPath := strings.TrimPrefix(path, "./")
 	lines := strings.Split(string(out), "\x00")
-	fis := make([]os.FileInfo, len(lines)-1)
+	fis := make([]fs.FileInfo, len(lines)-1)
 	for i, line := range lines {
 		if i == len(lines)-1 {
 			// last entry is empty
@@ -220,7 +242,7 @@ func lsTreeUncached(ctx context.Context, repo gitserver.Repo, commit api.CommitI
 
 		tabPos := strings.IndexByte(line, '\t')
 		if tabPos == -1 {
-			return nil, fmt.Errorf("invalid `git ls-tree` output: %q", out)
+			return nil, errors.Errorf("invalid `git ls-tree` output: %q", out)
 		}
 		info := strings.SplitN(line[:tabPos], " ", 4)
 		name := line[tabPos+1:]
@@ -231,12 +253,12 @@ func lsTreeUncached(ctx context.Context, repo gitserver.Repo, commit api.CommitI
 		}
 
 		if len(info) != 4 {
-			return nil, fmt.Errorf("invalid `git ls-tree` output: %q", out)
+			return nil, errors.Errorf("invalid `git ls-tree` output: %q", out)
 		}
 		typ := info[1]
 		sha := info[2]
 		if !IsAbsoluteRevision(sha) {
-			return nil, fmt.Errorf("invalid `git ls-tree` SHA output: %q", sha)
+			return nil, errors.Errorf("invalid `git ls-tree` SHA output: %q", sha)
 		}
 		oid, err := decodeOID(sha)
 		if err != nil {
@@ -249,7 +271,7 @@ func lsTreeUncached(ctx context.Context, repo gitserver.Repo, commit api.CommitI
 			// Size of "-" indicates a dir or submodule.
 			size, err = strconv.ParseInt(sizeStr, 10, 64)
 			if err != nil || size < 0 {
-				return nil, fmt.Errorf("invalid `git ls-tree` size output: %q (error: %s)", sizeStr, err)
+				return nil, errors.Errorf("invalid `git ls-tree` size output: %q (error: %s)", sizeStr, err)
 			}
 		}
 
@@ -278,7 +300,7 @@ func lsTreeUncached(ctx context.Context, repo gitserver.Repo, commit api.CommitI
 				var cfg config.Config
 				err := config.NewDecoder(bytes.NewBuffer(out)).Decode(&cfg)
 				if err != nil {
-					return nil, fmt.Errorf("error parsing .gitmodules: %s", err)
+					return nil, errors.Errorf("error parsing .gitmodules: %s", err)
 				}
 
 				submodule.Path = cfg.Section("submodule").Subsection(name).Option("path")
@@ -297,7 +319,7 @@ func lsTreeUncached(ctx context.Context, repo gitserver.Repo, commit api.CommitI
 
 		fis[i] = &util.FileInfo{
 			Name_: name, // full path relative to root (not just basename)
-			Mode_: os.FileMode(mode),
+			Mode_: mode,
 			Size_: size,
 			Sys_:  sys,
 		}

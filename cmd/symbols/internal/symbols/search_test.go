@@ -3,15 +3,14 @@ package symbols
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 	"testing"
 
 	"github.com/inconshreveable/log15"
-	"github.com/sourcegraph/sourcegraph/cmd/symbols/internal/pkg/ctags"
-	"github.com/sourcegraph/sourcegraph/internal/sqliteutil"
-	"github.com/sourcegraph/sourcegraph/internal/symbols/protocol"
+
+	"github.com/sourcegraph/sourcegraph/cmd/symbols/internal/protocol"
+	"github.com/sourcegraph/sourcegraph/cmd/symbols/internal/sqliteutil"
 	"github.com/sourcegraph/sourcegraph/internal/testutil"
 )
 
@@ -21,11 +20,9 @@ func BenchmarkSearch(b *testing.B) {
 	log15.Root().SetHandler(log15.LvlFilterHandler(log15.LvlError, log15.Root().GetHandler()))
 
 	service := Service{
-		FetchTar: testutil.FetchTarFromGithub,
-		NewParser: func() (ctags.Parser, error) {
-			return ctags.New()
-		},
-		Path: "/tmp/symbols-cache",
+		FetchTar:  testutil.FetchTarFromGithub,
+		NewParser: NewParser,
+		Path:      "/tmp/symbols-cache",
 	}
 	if err := service.Start(); err != nil {
 		b.Fatal(err)
@@ -49,7 +46,7 @@ func BenchmarkSearch(b *testing.B) {
 	runIndexTest := func(test protocol.SearchArgs) {
 		b.Run(fmt.Sprintf("indexing %s@%s", path.Base(string(test.Repo)), test.CommitID[:3]), func(b *testing.B) {
 			for n := 0; n < b.N; n++ {
-				tempFile, err := ioutil.TempFile("", "")
+				tempFile, err := os.CreateTemp("", "")
 				if err != nil {
 					b.Fatal(err)
 				}

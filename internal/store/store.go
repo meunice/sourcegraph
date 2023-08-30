@@ -16,7 +16,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cockroachdb/errors"
+	"github.com/inconshreveable/log15"
 	"github.com/opentracing/opentracing-go"
+	"github.com/opentracing/opentracing-go/ext"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+
 	"github.com/sourcegraph/sourcegraph/internal/api"
 	"github.com/sourcegraph/sourcegraph/internal/conf"
 	"github.com/sourcegraph/sourcegraph/internal/diskcache"
@@ -24,10 +30,6 @@ import (
 	"github.com/sourcegraph/sourcegraph/internal/metrics"
 	"github.com/sourcegraph/sourcegraph/internal/mutablelimiter"
 	"github.com/sourcegraph/sourcegraph/internal/trace/ot"
-
-	"github.com/opentracing/opentracing-go/ext"
-	"github.com/pkg/errors"
-	"github.com/prometheus/client_golang/prometheus"
 )
 
 // maxFileSize is the limit on file size in bytes. Only files smaller
@@ -54,7 +56,10 @@ type Store struct {
 	// FetchTar returns an io.ReadCloser to a tar archive of a repository at the specified Git
 	// remote URL and commit ID. If the error implements "BadRequest() bool", it will be used to
 	// determine if the error is a bad request (eg invalid repo).
-	FetchTar func(ctx context.Context, repo gitserver.Repo, commit api.CommitID) (io.ReadCloser, error)
+	FetchTar func(ctx context.Context, repo api.RepoName, commit api.CommitID) (io.ReadCloser, error)
+
+	// FilterTar returns a FilterFunc that filters out files we don't want to write to disk
+	FilterTar func(ctx context.Context, repo api.RepoName, commit api.CommitID) (FilterFunc, error)
 
 	// Path is the directory to store the cache
 	Path string
@@ -78,42 +83,33 @@ type Store struct {
 	ZipCache ZipCache
 }
 
-// SetMaxConcurrentFetchTar sets the maximum number of concurrent calls allowed
-// to FetchTar. It defaults to 15.
-func (s *Store) SetMaxConcurrentFetchTar(limit int) {
-	if limit == 0 {
-		limit = 15
-	}
-	if s.fetchLimiter == nil {
-		s.fetchLimiter = mutablelimiter.New(limit)
-	} else {
-		s.fetchLimiter.SetLimit(limit)
-	}
-}
+// FilterFunc filters tar files based on their header.
+// Tar files for which FilterFunc evaluates to true
+// are not stored in the target zip.
+type FilterFunc func(hdr *tar.Header) bool
 
 // Start initializes state and starts background goroutines. It can be called
 // more than once. It is optional to call, but starting it earlier avoids a
 // search request paying the cost of initializing.
 func (s *Store) Start() {
 	s.once.Do(func() {
-		if s.fetchLimiter == nil {
-			s.SetMaxConcurrentFetchTar(0)
-		}
+		s.fetchLimiter = mutablelimiter.New(15)
 		s.cache = &diskcache.Store{
 			Dir:               s.Path,
 			Component:         "store",
-			BackgroundTimeout: 2 * time.Minute,
+			BackgroundTimeout: 10 * time.Minute,
 			BeforeEvict:       s.ZipCache.delete,
 		}
 		_ = os.MkdirAll(s.Path, 0700)
 		metrics.MustRegisterDiskMonitor(s.Path)
 		go s.watchAndEvict()
+		go s.watchConfig()
 	})
 }
 
 // PrepareZip returns the path to a local zip archive of repo at commit.
 // It will first consult the local cache, otherwise will fetch from the network.
-func (s *Store) PrepareZip(ctx context.Context, repo gitserver.Repo, commit api.CommitID) (path string, err error) {
+func (s *Store) PrepareZip(ctx context.Context, repo api.RepoName, commit api.CommitID) (path string, err error) {
 	span, ctx := ot.StartSpanFromContext(ctx, "Store.prepareZip")
 	ext.Component.Set(span, "store")
 	defer func() {
@@ -130,13 +126,13 @@ func (s *Store) PrepareZip(ctx context.Context, repo gitserver.Repo, commit api.
 	// We already validate commit is absolute in ServeHTTP, but since we
 	// rely on it for caching we check again.
 	if len(commit) != 40 {
-		return "", errors.Errorf("commit must be resolved (repo=%q, commit=%q)", repo.Name, commit)
+		return "", errors.Errorf("commit must be resolved (repo=%q, commit=%q)", repo, commit)
 	}
 
 	largeFilePatterns := conf.Get().SearchLargeFiles
 
 	// key is a sha256 hash since we want to use it for the disk name
-	h := sha256.Sum256([]byte(fmt.Sprintf("%q %q %q", repo.Name, commit, largeFilePatterns)))
+	h := sha256.Sum256([]byte(fmt.Sprintf("%q %q %q", repo, commit, largeFilePatterns)))
 	key := hex.EncodeToString(h[:])
 	span.LogKV("key", key)
 
@@ -148,6 +144,7 @@ func (s *Store) PrepareZip(ctx context.Context, repo gitserver.Repo, commit api.
 	}
 	resC := make(chan result, 1)
 	go func() {
+		start := time.Now()
 		// TODO: consider adding a cache method that doesn't actually bother opening the file,
 		// since we're just going to close it again immediately.
 		bgctx := opentracing.ContextWithSpan(context.Background(), opentracing.SpanFromContext(ctx))
@@ -160,6 +157,9 @@ func (s *Store) PrepareZip(ctx context.Context, repo gitserver.Repo, commit api.
 			if f.File != nil {
 				f.File.Close()
 			}
+		}
+		if err != nil {
+			log15.Error("failed to fetch archive", "repo", repo, "commit", commit, "duration", time.Since(start), "error", err)
 		}
 		resC <- result{path, err}
 	}()
@@ -179,7 +179,7 @@ func (s *Store) PrepareZip(ctx context.Context, repo gitserver.Repo, commit api.
 // fetch fetches an archive from the network and stores it on disk. It does
 // not populate the in-memory cache. You should probably be calling
 // prepareZip.
-func (s *Store) fetch(ctx context.Context, repo gitserver.Repo, commit api.CommitID, largeFilePatterns []string) (rc io.ReadCloser, err error) {
+func (s *Store) fetch(ctx context.Context, repo api.RepoName, commit api.CommitID, largeFilePatterns []string) (rc io.ReadCloser, err error) {
 	fetchQueueSize.Inc()
 	ctx, releaseFetchLimiter, err := s.fetchLimiter.Acquire(ctx) // Acquire concurrent fetches semaphore
 	if err != nil {
@@ -194,8 +194,7 @@ func (s *Store) fetch(ctx context.Context, repo gitserver.Repo, commit api.Commi
 	fetching.Inc()
 	span, ctx := ot.StartSpanFromContext(ctx, "Store.fetch")
 	ext.Component.Set(span, "store")
-	span.SetTag("repo", repo.Name)
-	span.SetTag("repoURL", repo.URL)
+	span.SetTag("repo", repo)
 	span.SetTag("commit", commit)
 
 	// Done is called when the returned reader is closed, or if this function
@@ -228,6 +227,14 @@ func (s *Store) fetch(ctx context.Context, repo gitserver.Repo, commit api.Commi
 		return nil, err
 	}
 
+	filter := func(hdr *tar.Header) bool { return false } // default: don't filter
+	if s.FilterTar != nil {
+		filter, err = s.FilterTar(ctx, repo, commit)
+		if err != nil {
+			return nil, errors.Errorf("error while calling FilterTar: %w", err)
+		}
+	}
+
 	pr, pw := io.Pipe()
 
 	// After this point we are not allowed to return an error. Instead we can
@@ -240,7 +247,7 @@ func (s *Store) fetch(ctx context.Context, repo gitserver.Repo, commit api.Commi
 		defer r.Close()
 		tr := tar.NewReader(r)
 		zw := zip.NewWriter(pw)
-		err := copySearchable(tr, zw, largeFilePatterns)
+		err := copySearchable(tr, zw, largeFilePatterns, filter)
 		if err1 := zw.Close(); err == nil {
 			err = err1
 		}
@@ -253,9 +260,8 @@ func (s *Store) fetch(ctx context.Context, repo gitserver.Repo, commit api.Commi
 }
 
 // copySearchable copies searchable files from tr to zw. A searchable file is
-// any file that is a candidate for being searched (under size limit and
-// non-binary).
-func copySearchable(tr *tar.Reader, zw *zip.Writer, largeFilePatterns []string) error {
+// any file that is under size limit, non-binary, and not matching the filter.
+func copySearchable(tr *tar.Reader, zw *zip.Writer, largeFilePatterns []string, filter FilterFunc) error {
 	// 32*1024 is the same size used by io.Copy
 	buf := make([]byte, 32*1024)
 	for {
@@ -276,6 +282,11 @@ func copySearchable(tr *tar.Reader, zw *zip.Writer, largeFilePatterns []string) 
 
 		// We only care about files
 		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
+			continue
+		}
+
+		// ignore files if they match the filter
+		if filter(hdr) {
 			continue
 		}
 
@@ -339,17 +350,8 @@ func (s *Store) watchAndEvict() {
 		return
 	}
 
-	ctx := context.Background()
-	prevAddrs := len(gitserver.DefaultClient.Addrs(ctx))
 	for {
 		time.Sleep(10 * time.Second)
-
-		// Allow roughly 10 fetches per gitserver
-		addrs := len(gitserver.DefaultClient.Addrs(ctx))
-		if addrs != prevAddrs {
-			prevAddrs = addrs
-			s.SetMaxConcurrentFetchTar(10 * addrs)
-		}
 
 		stats, err := s.cache.Evict(s.MaxCacheSizeBytes)
 		if err != nil {
@@ -358,6 +360,20 @@ func (s *Store) watchAndEvict() {
 		}
 		cacheSizeBytes.Set(float64(stats.CacheSize))
 		evictions.Add(float64(stats.Evicted))
+	}
+}
+
+// watchConfig updates fetchLimiter as the number of gitservers change.
+func (s *Store) watchConfig() {
+	for {
+		// Allow roughly 10 fetches per gitserver
+		limit := 10 * len(gitserver.DefaultClient.Addrs())
+		if limit == 0 {
+			limit = 15
+		}
+		s.fetchLimiter.SetLimit(limit)
+
+		time.Sleep(10 * time.Second)
 	}
 }
 
@@ -374,23 +390,23 @@ func ignoreSizeMax(name string, patterns []string) bool {
 }
 
 var (
-	cacheSizeBytes = prometheus.NewGauge(prometheus.GaugeOpts{
+	cacheSizeBytes = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "searcher_store_cache_size_bytes",
 		Help: "The total size of items in the on disk cache.",
 	})
-	evictions = prometheus.NewCounter(prometheus.CounterOpts{
+	evictions = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "searcher_store_evictions",
 		Help: "The total number of items evicted from the cache.",
 	})
-	fetching = prometheus.NewGauge(prometheus.GaugeOpts{
+	fetching = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "searcher_store_fetching",
 		Help: "The number of fetches currently running.",
 	})
-	fetchQueueSize = prometheus.NewGauge(prometheus.GaugeOpts{
+	fetchQueueSize = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "searcher_store_fetch_queue_size",
 		Help: "The number of fetch jobs enqueued.",
 	})
-	fetchFailed = prometheus.NewCounter(prometheus.CounterOpts{
+	fetchFailed = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "searcher_store_fetch_failed",
 		Help: "The total number of archive fetches that failed.",
 	})
@@ -405,12 +421,4 @@ type temporaryError struct {
 
 func (temporaryError) Temporary() bool {
 	return true
-}
-
-func init() {
-	prometheus.MustRegister(cacheSizeBytes)
-	prometheus.MustRegister(evictions)
-	prometheus.MustRegister(fetching)
-	prometheus.MustRegister(fetchQueueSize)
-	prometheus.MustRegister(fetchFailed)
 }

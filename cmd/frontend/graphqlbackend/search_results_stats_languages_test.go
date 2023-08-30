@@ -4,16 +4,16 @@ import (
 	"bytes"
 	"context"
 	"io"
-	"io/ioutil"
-	"os"
+	"io/fs"
 	"reflect"
 	"strings"
 	"testing"
 
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/inventory"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/types"
 	"github.com/sourcegraph/sourcegraph/internal/api"
+	"github.com/sourcegraph/sourcegraph/internal/inventory"
 	"github.com/sourcegraph/sourcegraph/internal/rcache"
+	"github.com/sourcegraph/sourcegraph/internal/search/result"
+	"github.com/sourcegraph/sourcegraph/internal/types"
 	"github.com/sourcegraph/sourcegraph/internal/vcs/git"
 )
 
@@ -34,7 +34,7 @@ func TestSearchResultsStatsLanguages(t *testing.T) {
 		default:
 			panic("unhandled mock NewFileReader " + name)
 		}
-		return ioutil.NopCloser(bytes.NewReader(data)), nil
+		return io.NopCloser(bytes.NewReader(data)), nil
 	}
 	const wantDefaultBranchRef = "refs/heads/foo"
 	git.Mocks.ExecSafe = func(params []string) (stdout, stderr []byte, exitCode int, err error) {
@@ -54,9 +54,18 @@ func TestSearchResultsStatsLanguages(t *testing.T) {
 	}
 	defer git.ResetMocks()
 
+	mkResult := func(path string, lineNumbers ...int32) *result.FileMatch {
+		rn := types.RepoName{
+			Name: "r",
+		}
+		fm := mkFileMatch(rn, path, lineNumbers...)
+		fm.CommitID = wantCommitID
+		return fm
+	}
+
 	tests := map[string]struct {
-		results  []SearchResultResolver
-		getFiles []os.FileInfo
+		results  []result.Match
+		getFiles []fs.FileInfo
 		want     []inventory.Lang // TotalBytes values are incorrect (known issue doc'd in GraphQL schema)
 	}{
 		"empty": {
@@ -64,50 +73,29 @@ func TestSearchResultsStatsLanguages(t *testing.T) {
 			want:    []inventory.Lang{},
 		},
 		"1 entire file": {
-			results: []SearchResultResolver{
-				&FileMatchResolver{
-					JPath:    "three.go",
-					Repo:     &RepositoryResolver{repo: &types.Repo{Name: "r"}},
-					CommitID: wantCommitID,
-				},
+			results: []result.Match{
+				mkResult("three.go"),
 			},
 			want: []inventory.Lang{{Name: "Go", TotalBytes: 6, TotalLines: 3}},
 		},
 		"line matches in 1 file": {
-			results: []SearchResultResolver{
-				&FileMatchResolver{
-					JPath:        "three.go",
-					Repo:         &RepositoryResolver{repo: &types.Repo{Name: "r"}},
-					CommitID:     wantCommitID,
-					JLineMatches: []*lineMatch{{JLineNumber: 1}},
-				},
+			results: []result.Match{
+				mkResult("three.go", 1),
 			},
 			want: []inventory.Lang{{Name: "Go", TotalBytes: 6, TotalLines: 1}},
 		},
 		"line matches in 2 files": {
-			results: []SearchResultResolver{
-				&FileMatchResolver{
-					JPath:        "two.go",
-					Repo:         &RepositoryResolver{repo: &types.Repo{Name: "r"}},
-					CommitID:     wantCommitID,
-					JLineMatches: []*lineMatch{{JLineNumber: 1}, {JLineNumber: 2}},
-				},
-				&FileMatchResolver{
-					JPath:        "three.go",
-					Repo:         &RepositoryResolver{repo: &types.Repo{Name: "r"}},
-					CommitID:     wantCommitID,
-					JLineMatches: []*lineMatch{{JLineNumber: 1}},
-				},
+			results: []result.Match{
+				mkResult("two.go", 1, 2),
+				mkResult("three.go", 1),
 			},
 			want: []inventory.Lang{{Name: "Go", TotalBytes: 10, TotalLines: 3}},
 		},
 		"1 entire repo": {
-			results: []SearchResultResolver{
-				&RepositoryResolver{
-					repo: &types.Repo{Name: "r"},
-				},
+			results: []result.Match{
+				&result.RepoMatch{Name: "r"},
 			},
-			getFiles: []os.FileInfo{
+			getFiles: []fs.FileInfo{
 				fileInfo{path: "two.go"},
 				fileInfo{path: "three.go"},
 			},
@@ -116,7 +104,7 @@ func TestSearchResultsStatsLanguages(t *testing.T) {
 	}
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			git.Mocks.ReadDir = func(commit api.CommitID, name string, recurse bool) ([]os.FileInfo, error) {
+			git.Mocks.ReadDir = func(commit api.CommitID, name string, recurse bool) ([]fs.FileInfo, error) {
 				return test.getFiles, nil
 			}
 

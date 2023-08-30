@@ -3,17 +3,18 @@ package backend
 import (
 	"bytes"
 	"context"
-	"io/ioutil"
+	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/envvar"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/types"
 	"github.com/sourcegraph/sourcegraph/internal/api"
 	"github.com/sourcegraph/sourcegraph/internal/extsvc"
 	"github.com/sourcegraph/sourcegraph/internal/rcache"
+	"github.com/sourcegraph/sourcegraph/internal/types"
 	"github.com/sourcegraph/sourcegraph/internal/vcs/git"
 	"github.com/sourcegraph/sourcegraph/internal/vcs/util"
 )
@@ -48,8 +49,8 @@ func TestCountGoImporters(t *testing.T) {
 	git.Mocks.ResolveRevision = func(spec string, opt git.ResolveRevisionOptions) (api.CommitID, error) {
 		return "c", nil
 	}
-	git.Mocks.ReadDir = func(commit api.CommitID, name string, recurse bool) ([]os.FileInfo, error) {
-		return []os.FileInfo{
+	git.Mocks.ReadDir = func(commit api.CommitID, name string, recurse bool) ([]fs.FileInfo, error) {
+		return []fs.FileInfo{
 			&util.FileInfo{Name_: "d/a.go", Mode_: os.ModeDir},
 			&util.FileInfo{Name_: "d/b.go", Mode_: os.ModeDir},
 			&util.FileInfo{Name_: "c.go", Mode_: 0},
@@ -80,7 +81,7 @@ type mockRoundTripper struct {
 func (t mockRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	return &http.Response{
 		StatusCode: http.StatusOK,
-		Body:       ioutil.NopCloser(bytes.NewBufferString(t.response)),
+		Body:       io.NopCloser(bytes.NewBufferString(t.response)),
 		Header:     make(http.Header),
 	}, nil
 }

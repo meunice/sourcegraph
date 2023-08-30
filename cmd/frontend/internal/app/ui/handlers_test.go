@@ -3,34 +3,51 @@ package ui
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"testing"
 
 	"github.com/gorilla/mux"
+
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/backend"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/envvar"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/globals"
 	uirouter "github.com/sourcegraph/sourcegraph/cmd/frontend/internal/app/ui/router"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/pkg/siteid"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/types"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/siteid"
 	"github.com/sourcegraph/sourcegraph/internal/api"
 	"github.com/sourcegraph/sourcegraph/internal/conf"
-	"github.com/sourcegraph/sourcegraph/internal/db/globalstatedb"
+	"github.com/sourcegraph/sourcegraph/internal/database/dbtesting"
+	"github.com/sourcegraph/sourcegraph/internal/database/globalstatedb"
 	"github.com/sourcegraph/sourcegraph/internal/gitserver"
 	"github.com/sourcegraph/sourcegraph/internal/repoupdater"
+	"github.com/sourcegraph/sourcegraph/internal/types"
 	"github.com/sourcegraph/sourcegraph/internal/vcs"
 	"github.com/sourcegraph/sourcegraph/internal/vcs/git"
 	"github.com/sourcegraph/sourcegraph/internal/vcs/util"
+	"github.com/sourcegraph/sourcegraph/ui/assets"
 )
 
 func TestRedirects(t *testing.T) {
-	check := func(t *testing.T, path string, wantStatusCode int, wantRedirectLocation string) {
+	assets.MockLoadWebpackManifest = func() (*assets.WebpackManifest, error) {
+		return &assets.WebpackManifest{}, nil
+	}
+	defer func() { assets.MockLoadWebpackManifest = nil }()
+
+	check := func(t *testing.T, path string, wantStatusCode int, wantRedirectLocation, userAgent string) {
 		t.Helper()
 
+		db := new(dbtesting.MockDB)
+
+		InitRouter(db)
 		rw := httptest.NewRecorder()
-		req, _ := http.NewRequest("GET", path, nil)
+		req, err := http.NewRequest("GET", path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		req.Header.Set("User-Agent", userAgent)
 		uirouter.Router.ServeHTTP(rw, req)
 		if rw.Code != wantStatusCode {
 			t.Errorf("got HTTP response code %d, want %d", rw.Code, wantStatusCode)
@@ -45,15 +62,25 @@ func TestRedirects(t *testing.T) {
 		envvar.MockSourcegraphDotComMode(true)
 		defer envvar.MockSourcegraphDotComMode(orig) // reset
 		t.Run("root", func(t *testing.T) {
-			check(t, "/", http.StatusTemporaryRedirect, "https://about.sourcegraph.com")
+			check(t, "/", http.StatusTemporaryRedirect, "https://about.sourcegraph.com", "Mozilla/5.0")
 		})
 	})
+
+	t.Run("on Sourcegraph.com from Cookiebot", func(t *testing.T) {
+		orig := envvar.SourcegraphDotComMode()
+		envvar.MockSourcegraphDotComMode(true)
+		defer envvar.MockSourcegraphDotComMode(orig) // reset
+		t.Run("root", func(t *testing.T) {
+			check(t, "/", http.StatusTemporaryRedirect, "/search", "Mozilla/5.0 Cookiebot")
+		})
+	})
+
 	t.Run("non-Sourcegraph.com", func(t *testing.T) {
 		orig := envvar.SourcegraphDotComMode()
 		envvar.MockSourcegraphDotComMode(false)
 		defer envvar.MockSourcegraphDotComMode(orig) // reset
 		t.Run("root", func(t *testing.T) {
-			check(t, "/", http.StatusTemporaryRedirect, "/search")
+			check(t, "/", http.StatusTemporaryRedirect, "/search", "Mozilla/5.0")
 		})
 	})
 }
@@ -78,6 +105,11 @@ func TestRepoShortName(t *testing.T) {
 }
 
 func TestNewCommon_repo_error(t *testing.T) {
+	assets.MockLoadWebpackManifest = func() (*assets.WebpackManifest, error) {
+		return &assets.WebpackManifest{}, nil
+	}
+	defer func() { assets.MockLoadWebpackManifest = nil }()
+
 	cases := []struct {
 		name string
 		rev  string
@@ -168,7 +200,7 @@ func TestRedirectTreeOrBlob(t *testing.T) {
 		route         string
 		path          string
 		common        *Common
-		mockStat      os.FileInfo
+		mockStat      fs.FileInfo
 		expHandled    bool
 		expStatusCode int
 		expLocation   string
@@ -361,7 +393,7 @@ func TestRedirectTreeOrBlob(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			git.Mocks.Stat = func(commit api.CommitID, name string) (os.FileInfo, error) {
+			git.Mocks.Stat = func(commit api.CommitID, name string) (fs.FileInfo, error) {
 				return test.mockStat, nil
 			}
 			t.Cleanup(git.ResetMocks)

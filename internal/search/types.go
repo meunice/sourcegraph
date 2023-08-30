@@ -2,36 +2,56 @@ package search
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/sourcegraph/sourcegraph/internal/api"
 	"github.com/sourcegraph/sourcegraph/internal/endpoint"
-	"github.com/sourcegraph/sourcegraph/internal/gitserver"
 	searchbackend "github.com/sourcegraph/sourcegraph/internal/search/backend"
+	"github.com/sourcegraph/sourcegraph/internal/search/filter"
 	"github.com/sourcegraph/sourcegraph/internal/search/query"
+	"github.com/sourcegraph/sourcegraph/internal/search/result"
+	"github.com/sourcegraph/sourcegraph/internal/types"
 	"github.com/sourcegraph/sourcegraph/internal/vcs/git"
+	"github.com/sourcegraph/sourcegraph/schema"
 )
 
 type TypeParameters interface {
 	typeParametersValue()
 }
 
-func (c CommitParameters) typeParametersValue()  {}
-func (d DiffParameters) typeParametersValue()    {}
-func (s SymbolsParameters) typeParametersValue() {}
-func (t TextParameters) typeParametersValue()    {}
+func (CommitParameters) typeParametersValue()  {}
+func (DiffParameters) typeParametersValue()    {}
+func (SymbolsParameters) typeParametersValue() {}
+func (TextParameters) typeParametersValue()    {}
 
 type CommitParameters struct {
 	RepoRevs           *RepositoryRevisions
 	PatternInfo        *CommitPatternInfo
-	Query              query.QueryInfo
+	Query              query.Q
 	Diff               bool
 	ExtraMessageValues []string
 }
 
 type DiffParameters struct {
-	Repo    gitserver.Repo
+	Repo    api.RepoName
 	Options git.RawLogDiffSearchOptions
+}
+
+// CommitPatternInfo is the data type that describes the properties of
+// a pattern used for commit search.
+type CommitPatternInfo struct {
+	Pattern         string
+	IsRegExp        bool
+	IsCaseSensitive bool
+	FileMatchLimit  int32
+
+	IncludePatterns []string
+	ExcludePattern  string
+
+	PathPatternsAreRegExps       bool
+	PathPatternsAreCaseSensitive bool
 }
 
 type SymbolsParameters struct {
@@ -68,17 +88,66 @@ type SymbolsParameters struct {
 	First int
 }
 
+// GlobalSearchMode designates code paths which optimize performance for global
+// searches, i.e., literal or regexp, indexed searches without repo: filter.
+type GlobalSearchMode int
+
+const (
+	DefaultMode GlobalSearchMode = iota
+
+	// ZoektGlobalSearch designates a performance optimised code path for indexed
+	// searches. For a global search we don't need to resolve repos before searching
+	// shards on Zoekt, instead we can resolve repos and call Zoekt concurrently.
+	//
+	// Note: Even for a global search we have to resolve repos to filter search results
+	// returned by Zoekt.
+	ZoektGlobalSearch
+
+	// SearcherOnly designated a code path on which we skip indexed search, even if
+	// the user specified index:yes. SearcherOnly is used in conjunction with
+	// ZoektGlobalSearch and designates the non-indexed part of the performance
+	// optimised code path.
+	SearcherOnly
+
+	// Disables content and file path search. Used:
+	// (1) in conjunction with ZoektGlobalSearch on Sourcegraph.com.
+	// (2) when a query does not specify any patterns for a content or file path search.
+	SkipContentAndPathSearch
+)
+
+var globalSearchModeStrings = map[GlobalSearchMode]string{
+	ZoektGlobalSearch:        "ZoektGlobalSearch",
+	SearcherOnly:             "SearcherOnly",
+	SkipContentAndPathSearch: "SkipContentAndPathSearch",
+}
+
+func (m GlobalSearchMode) String() string {
+	if s, ok := globalSearchModeStrings[m]; ok {
+		return s
+	}
+	return "None"
+}
+
 // TextParameters are the parameters passed to a search backend. It contains the Pattern
 // to search for, as well as the hydrated list of repository revisions to
 // search. It defines behavior for text search on repository names, file names, and file content.
 type TextParameters struct {
 	PatternInfo *TextPatternInfo
-	Repos       []*RepositoryRevisions
+	RepoOptions RepoOptions
+	ResultTypes result.Types
+	Timeout     time.Duration
+
+	// deprecated
+	RepoPromise *RepoPromise
+
+	// perf: For global queries, we only resolve private repos.
+	UserPrivateRepos []types.RepoName
+	Mode             GlobalSearchMode
 
 	// Query is the parsed query from the user. You should be using Pattern
 	// instead, but Query is useful for checking extra fields that are set and
 	// ignored by Pattern, such as index:no
-	Query query.QueryInfo
+	Query query.Q
 
 	// UseFullDeadline indicates that the search should try do as much work as
 	// it can within context.Deadline. If false the search should try and be
@@ -100,19 +169,22 @@ type TextParameters struct {
 type TextParametersForCommitParameters struct {
 	PatternInfo *CommitPatternInfo
 	Repos       []*RepositoryRevisions
-	Query       query.QueryInfo
+	Query       query.Q
 }
 
 // TextPatternInfo is the struct used by vscode pass on search queries. Keep it in
 // sync with pkg/searcher/protocol.PatternInfo.
 type TextPatternInfo struct {
 	Pattern         string
+	IsNegated       bool
 	IsRegExp        bool
 	IsStructuralPat bool
 	CombyRule       string
 	IsWordMatch     bool
 	IsCaseSensitive bool
 	FileMatchLimit  int32
+	Index           query.YesNoOnly
+	Select          filter.SelectPath
 
 	// We do not support IsMultiline
 	// IsMultiline     bool
@@ -182,17 +254,69 @@ func (p *TextPatternInfo) String() string {
 	return fmt.Sprintf("TextPatternInfo{%s}", strings.Join(args, ","))
 }
 
-// CommitPatternInfo is the data type that describes the properties of
-// a pattern used for commit search.
-type CommitPatternInfo struct {
-	Pattern         string
-	IsRegExp        bool
-	IsCaseSensitive bool
-	FileMatchLimit  int32
+type RepoOptions struct {
+	RepoFilters        []string
+	MinusRepoFilters   []string
+	RepoGroupFilters   []string
+	SearchContextSpec  string
+	VersionContextName string
+	UserSettings       *schema.Settings
+	NoForks            bool
+	OnlyForks          bool
+	NoArchived         bool
+	OnlyArchived       bool
+	CommitAfter        string
+	OnlyPrivate        bool
+	OnlyPublic         bool
+	Ranked             bool // Return results ordered by rank
+	Limit              int
+	CacheLookup        bool
+	Query              query.Q
+}
 
-	IncludePatterns []string
-	ExcludePattern  string
+func (op *RepoOptions) String() string {
+	var b strings.Builder
+	if len(op.RepoFilters) == 0 {
+		b.WriteString("r=[]")
+	}
+	for i, r := range op.RepoFilters {
+		if i != 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(strconv.Quote(r))
+	}
 
-	PathPatternsAreRegExps       bool
-	PathPatternsAreCaseSensitive bool
+	if len(op.MinusRepoFilters) > 0 {
+		_, _ = fmt.Fprintf(&b, " -r=%v", op.MinusRepoFilters)
+	}
+	if len(op.RepoGroupFilters) > 0 {
+		_, _ = fmt.Fprintf(&b, " groups=%v", op.RepoGroupFilters)
+	}
+	if op.VersionContextName != "" {
+		_, _ = fmt.Fprintf(&b, " versionContext=%q", op.VersionContextName)
+	}
+	if op.CommitAfter != "" {
+		_, _ = fmt.Fprintf(&b, " CommitAfter=%q", op.CommitAfter)
+	}
+
+	if op.NoForks {
+		b.WriteString(" NoForks")
+	}
+	if op.OnlyForks {
+		b.WriteString(" OnlyForks")
+	}
+	if op.NoArchived {
+		b.WriteString(" NoArchived")
+	}
+	if op.OnlyArchived {
+		b.WriteString(" OnlyArchived")
+	}
+	if op.OnlyPrivate {
+		b.WriteString(" OnlyPrivate")
+	}
+	if op.OnlyPublic {
+		b.WriteString(" OnlyPublic")
+	}
+
+	return b.String()
 }

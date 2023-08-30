@@ -9,13 +9,20 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/cockroachdb/errors"
 )
 
 const resultsBuffer = 5
 
+// options declares configuration available to users of the resourcs-report
+//
+// See flag usage strings in `main()` or `resources-report -help`
 type options struct {
-	slackWebhook    *string
-	sheetID         *string
+	slackWebhook        *string
+	sheetID             *string
+	sheetPruneOlderThan *time.Duration
+
 	window          *time.Duration
 	highlightWindow *time.Duration
 
@@ -36,16 +43,18 @@ func main() {
 	gcpAllowlistLabelsStr := flag.String("gcp.allowlist", "", "GCP labels to allowlist (comma-separated key:value pairs)")
 	awsAllowlistTagsStr := flag.String("aws.allowlist", "", "AWS tags to allowlist (comma-separated key:value pairs)")
 	opts := options{
-		slackWebhook:    flag.String("slack.webhook", os.Getenv("SLACK_WEBHOOK"), "Slack webhook to post updates to"),
-		sheetID:         flag.String("sheet.id", os.Getenv("SHEET_ID"), "Slack webhook to post updates to"),
+		slackWebhook:        flag.String("slack.webhook", os.Getenv("SLACK_WEBHOOK"), "Slack webhook to post updates to"),
+		sheetID:             flag.String("sheet.id", os.Getenv("SHEET_ID"), "ID of Google Sheet to write to"),
+		sheetPruneOlderThan: flag.Duration("sheet.pruneolderthan", 30*(24*time.Hour), "Prune report pages older than the given duration"),
+
 		gcp:             flag.Bool("gcp", false, "Report on Google Cloud resources"),
 		aws:             flag.Bool("aws", false, "Report on Amazon Web Services resources"),
 		window:          flag.Duration("window", 48*time.Hour, "Restrict results to resources created within a period"),
 		highlightWindow: flag.Duration("window.highlight", 24*time.Hour, "Highlight resources created within a period"),
 
-		runID:   flag.String("run.id", os.Getenv("GITHUB_RUN_ID"), "ID of workflow run"),
+		runID:   flag.String("run.id", os.Getenv("GITHUB_RUN_ID"), "ID of workflow run (for usage in GitHub Actions)"),
 		dry:     flag.Bool("dry", false, "Do not post updates to slack, but print them to stdout"),
-		verbose: flag.Bool("verbose", false, "Print debug output to stdout"),
+		verbose: flag.Bool("verbose", false, "Print debug output to stdout (WARNING: might include sensitive information)"),
 		timeout: flag.Duration("timeout", time.Minute, "Set a timeout for report generation"),
 	}
 	flag.Parse()
@@ -79,7 +88,7 @@ func run(opts options) error {
 		rs, err := collectGCPResources(ctx, since, *opts.verbose, opts.gcpLabelsAllowlist)
 		if err != nil {
 			reportError(ctx, opts, err, "gcp")
-			return fmt.Errorf("gcp: failed to collect resources")
+			return errors.Errorf("gcp: failed to collect resources")
 		}
 		resources = append(resources, rs...)
 	}
@@ -87,7 +96,7 @@ func run(opts options) error {
 		rs, err := collectAWSResources(ctx, since, *opts.verbose, opts.awsTagsAllowlist)
 		if err != nil {
 			reportError(ctx, opts, err, "aws")
-			return fmt.Errorf("aws: failed to collect resources")
+			return errors.Errorf("aws: failed to collect resources")
 		}
 		resources = append(resources, rs...)
 	}
@@ -100,7 +109,8 @@ func run(opts options) error {
 	}
 	if !*opts.dry {
 		if err := generateReport(ctx, opts, resources); err != nil {
-			return fmt.Errorf("report: %w", err)
+			reportError(ctx, opts, err, "report")
+			return errors.Errorf("report: %w", err)
 		}
 	}
 
@@ -108,6 +118,9 @@ func run(opts options) error {
 }
 
 func reportString(resources Resources) string {
+	if len(resources) == 0 {
+		return "none\n"
+	}
 	var output string
 	for _, r := range resources {
 		output += fmt.Sprintf(" * %+v\n", r)

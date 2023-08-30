@@ -1,15 +1,22 @@
 package httpcli
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"net/http"
+	"net/url"
+	"sync"
 	"time"
 
+	"github.com/PuerkitoBio/rehttp"
+	"github.com/cockroachdb/errors"
 	"github.com/gregjones/httpcache"
 	"github.com/hashicorp/go-multierror"
-	"github.com/pkg/errors"
-	"github.com/sourcegraph/sourcegraph/internal/httputil"
+	"github.com/inconshreveable/log15"
+
+	"github.com/sourcegraph/sourcegraph/internal/lazyregexp"
+	"github.com/sourcegraph/sourcegraph/internal/rcache"
 	"github.com/sourcegraph/sourcegraph/internal/trace/ot"
 )
 
@@ -57,6 +64,11 @@ type Factory struct {
 	common []Opt
 }
 
+// redisCache is a HTTP cache backed by Redis. The TTL of a week is a balance
+// between caching values for a useful amount of time versus growing the cache
+// too large.
+var redisCache = rcache.NewWithTTL("http", 604800)
+
 // NewExternalHTTPClientFactory returns an httpcli.Factory with common options
 // and middleware pre-set for communicating to external services.
 func NewExternalHTTPClientFactory() *Factory {
@@ -65,14 +77,60 @@ func NewExternalHTTPClientFactory() *Factory {
 		NewMiddleware(
 			ContextErrorMiddleware,
 		),
-		NewTimeoutOpt(60*time.Second),
+		NewTimeoutOpt(5*time.Minute),
 		// ExternalTransportOpt needs to be before TracedTransportOpt and
 		// NewCachedTransportOpt since it wants to extract a http.Transport,
 		// not a generic http.RoundTripper.
 		ExternalTransportOpt,
+		NewErrorResilientTransportOpt(
+			DefaultRetryPolicy,
+			rehttp.ExpJitterDelay(200*time.Millisecond, 10*time.Second),
+		),
 		TracedTransportOpt,
-		NewCachedTransportOpt(httputil.Cache, true),
+		NewCachedTransportOpt(redisCache, true),
 	)
+}
+
+var (
+	externalOnce       sync.Once
+	externalDoer       Doer
+	externalHTTPClient *http.Client
+)
+
+func externalInit() {
+	externalOnce.Do(func() {
+		var err error
+		externalDoer, err = NewExternalHTTPClientFactory().Doer()
+		if err != nil {
+			panic("httpcli: failed to create the default ExternalDoer. This should not happen: " + err.Error())
+		}
+		externalHTTPClient, err = NewExternalHTTPClientFactory().Client()
+		if err != nil {
+			panic("httpcli: failed to create the default ExternalHTTPClient. This should not happen: " + err.Error())
+		}
+	})
+}
+
+// ExternalDoer returns a shared client for external communication. This is a
+// convenience for existing uses of http.DefaultClient.
+//
+// NOTE: Use this for legacy code. New code should generally take in a
+// httpcli.Doer and at a high level NewExternalHTTPClientFactory() is called
+// and passed down.
+func ExternalDoer() Doer {
+	externalInit()
+	return externalDoer
+}
+
+// ExternalHTTPClient returns a shared client for external communication. This is
+// a convenience for existing uses of http.DefaultClient.
+//
+// NOTE: Use this for legacy code. New code should generally take in a
+// httpcli.Doer and at a high level NewExternalHTTPClientFactory() is called
+// and passed down.
+func ExternalHTTPClient() *http.Client {
+	externalInit()
+	return externalHTTPClient
 }
 
 // Doer returns a new Doer wrapped with the middleware stack
@@ -256,6 +314,89 @@ func TracedTransportOpt(cli *http.Client) error {
 
 	cli.Transport = &ot.Transport{RoundTripper: cli.Transport}
 	return nil
+}
+
+// A regular expression to match the error returned by net/http when the
+// configured number of redirects is exhausted. This error isn't typed
+// specifically so we resort to matching on the error string.
+var redirectsErrorRe = lazyregexp.New(`stopped after \d+ redirects\z`)
+
+// A regular expression to match the error returned by net/http when the
+// scheme specified in the URL is invalid. This error isn't typed
+// specifically so we resort to matching on the error string.
+var schemeErrorRe = lazyregexp.New(`unsupported protocol scheme`)
+
+// DefaultRetryPolicy is the retry policy used in any Doer or Client returned
+// by NewExternalHTTPClientFactory.
+func DefaultRetryPolicy(a rehttp.Attempt) (retry bool) {
+	status := 0
+
+	defer func() {
+		if !retry {
+			return
+		}
+
+		log15.Error(
+			"external HTTP request",
+			"attempt", a.Index,
+			"method", a.Request.Method,
+			"url", a.Request.URL,
+			"status", status,
+			"err", a.Error,
+		)
+	}()
+
+	if a.Response != nil {
+		status = a.Response.StatusCode
+	}
+
+	if a.Index > 20 { // Max retries
+		return false
+	}
+
+	switch a.Error {
+	case nil:
+	case context.DeadlineExceeded, context.Canceled:
+		return false
+	default:
+		if v, ok := a.Error.(*url.Error); ok {
+			// Don't retry if the error was due to too many redirects.
+			if redirectsErrorRe.MatchString(v.Error()) {
+				return false
+			}
+
+			// Don't retry if the error was due to an invalid protocol scheme.
+			if schemeErrorRe.MatchString(v.Error()) {
+				return false
+			}
+
+			// Don't retry if the error was due to TLS cert verification failure.
+			if _, ok := v.Err.(x509.UnknownAuthorityError); ok {
+				return false
+			}
+		}
+		// The error is likely recoverable so retry.
+		return true
+	}
+
+	if status == 0 || status == 429 || (status >= 500 && status != 501) {
+		return true
+	}
+
+	return false
+}
+
+// NewErrorResilientTransportOpt returns an Opt that wraps an existing
+// http.Transport of an http.Client with automatic retries.
+func NewErrorResilientTransportOpt(retry rehttp.RetryFn, delay rehttp.DelayFn) Opt {
+	return func(cli *http.Client) error {
+		if cli.Transport == nil {
+			cli.Transport = http.DefaultTransport
+		}
+
+		cli.Transport = rehttp.NewTransport(cli.Transport, retry, delay)
+		return nil
+	}
 }
 
 // NewIdleConnTimeoutOpt returns a Opt that sets the IdleConnTimeout of an

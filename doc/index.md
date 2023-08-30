@@ -1,10 +1,64 @@
-# Sourcegraph documentation
+---
+title: 'Sourcegraph docs'
+---
 
-[Sourcegraph](https://about.sourcegraph.com) is a web-based, self-hosted code search and navigation tool for developers, used by Uber, Lyft, Yelp, and more.
+<a href="https://sourcegraph.com"><picture><source srcset="assets/logo-theme-dark.svg" media="(prefers-color-scheme: dark)"/><img alt="Sourcegraph" src="assets/logo-theme-light.svg" height="48px" /></picture></a>
 
-## Quickstart guide
+<p class="subtitle">Universal Code Search: Move fast, even in big codebases.</p>
 
-It takes less than 5 minutes to run and install Sourcegraph using Docker:
+<p class="lead">
+Find and fix things across all of your code faster with Sourcegraph. Onboard to a new codebase, make large-scale refactors, increase efficiency, address security risks, root-cause incidents, and more.
+</p>
+
+This website is home to Sourcegraph's feature, installation, administration, and development documentation.
+
+<div class="cta-group">
+<a class="btn btn-primary" href="#getting-started">★ Try Sourcegraph now</a>
+<a class="btn" href="#core-documentation">Core documentation</a>
+<a class="btn" href="https://about.sourcegraph.com/">About Sourcegraph</a>
+</div>
+
+## Getting started
+
+<div class="getting-started">
+  <a href="https://sourcegraph.com/search" class="btn btn-primary" alt="Sourcegraph Cloud">
+   <span>★ Sourcegraph Cloud</span>
+   </br>
+   <b>Search open source code or your own public repositories.</b> No signup or installation required.
+  </a>
+
+  <a href="admin/install" class="btn btn-primary" alt="Self-host">
+   <span>★ Self-hosted instance</span>
+   </br>
+   Deploy and manage your own Sourcegraph instance. <b>Recommended for production deployments.</b>
+  </a>
+</div>
+
+<div class="getting-started">
+  <a href="admin/install/managed" class="btn" alt="Managed instance">
+   <span>Managed instance</span>
+   </br>
+    A private Sourcegraph deployment provisioned and managed by the Sourcegraph team.
+  </a>
+
+  <a href="#quick-install" class="btn" alt="Quick install">
+   <span>Local instance</span>
+   </br>
+   Quickly set up and try out Sourcegraph locally using Docker.
+  </a>
+</div>
+
+<span class="virtual-br"></span>
+
+> NOTE: Looking for how to *use* Sourcegraph? Refer to our [Using Sourcegraph guide](./getting-started/index.md)!
+
+<span class="virtual-br"></span>
+
+> NOTE: Unsure where to start, or need help? [Reach out to us](#get-help)!
+
+### Quick install
+
+You can quickly try out Sourcegraph locally using Docker, which takes only a few minutes and lets you try out all of its features:
 
 <!--
   DO NOT CHANGE THIS TO A CODEBLOCK.
@@ -12,83 +66,44 @@ It takes less than 5 minutes to run and install Sourcegraph using Docker:
   This uses line breaks that are rendered but not copy-pasted to the clipboard.
 -->
 
-<pre class="pre-wrap start-sourcegraph-command"><code>docker run<span class="virtual-br"></span> --publish 7080:7080 --publish 127.0.0.1:3370:3370 --rm<span class="virtual-br"></span> --volume ~/.sourcegraph/config:/etc/sourcegraph<span class="virtual-br"></span> --volume ~/.sourcegraph/data:/var/opt/sourcegraph<span class="virtual-br"></span> sourcegraph/server:3.18.0</code></pre>
+<pre class="pre-wrap start-sourcegraph-command" id="dockerInstall"><code>docker run -d<span class="virtual-br"></span> --publish 7080:7080 --publish 127.0.0.1:3370:3370 --rm<span class="virtual-br"></span> --volume ~/.sourcegraph/config:/etc/sourcegraph<span class="virtual-br"></span> --volume ~/.sourcegraph/data:/var/opt/sourcegraph<span class="virtual-br"></span> sourcegraph/server:3.30.1<span class="iconify copy-text" data-icon="mdi:clipboard-arrow-left-outline" data-inline="false"></span></code>
+</pre>
 
-Once the server is ready (logo is displayed in the terminal), navigate to the hostname or IP address on port `7080`.  Create the admin account, then you'll be guided through setting up Sourcegraph for code searching and navigation.
+For next steps, visit the [Docker installation documentation](admin/install/docker/index.md).
 
-<!--
-TODO(ryan): Replace with updated screencast
-<p class="container">
-  <div style="padding:56.25% 0 0 0;position:relative;">
-    <iframe src="https://player.vimeo.com/video/314926561?color=0CB6F4&title=0&byline=0&portrait=0" style="position:absolute;top:0;left:0;width:100%;height:100%;" frameborder="0" webkitallowfullscreen mozallowfullscreen allowfullscreen></iframe>
-  </div>
-</p>
--->
+> WARNING: **We *do not* recommend using this method for a production instance** - see [Getting started](#getting-started) for more options.
 
-For next steps and further configuration options, visit the [site administration documentation](admin/index.md).
+## Core documentation
 
-> NOTE: If you get stuck or need help, [file an issue](https://github.com/sourcegraph/sourcegraph/issues/new?&title=Improve+Sourcegraph+quickstart+guide), [tweet (@srcgraph)](https://twitter.com/srcgraph) or [email](mailto:support@sourcegraph.com?subject=Sourcegraph%20quickstart%20guide).
-
-<span class="virtual-br"></span>
-
-> NOTE: If you run Docker on an OS such as RHEL, Fedora, or CentOS with SELinux enabled, sVirt doesn't allow the Docker process
-to access `~/.sourcegraph/config` and `~/.sourcegraph/data`. In that case, you will see the following message:
-
-> `Failed to setup nginx:failed to generate nginx configuration to /etc/sourcegraph: open /etc/sourcegraph/nginx.conf: permission denied`.
-
-> To fix this, run:
-
-> `mkdir -p ~/.sourcegraph/config ~/.sourcegraph/data && chcon -R -t svirt_sandbox_file_t ~/.sourcegraph/config ~/.sourcegraph/data`
-
-## Upgrading Sourcegraph
-
-All you need to do to upgrade Sourcegraph is to restart your Docker server with a new image tag.
-
-We actively maintain the two most recent monthly releases of Sourcegraph.
-
-Upgrades should happen across consecutive minor versions of Sourcegraph. For example, if you are
-running Sourcegraph 3.1 and want to upgrade to 3.3, you should upgrade to 3.2 and then 3.3.
-
-> The Docker server image tags follow SemVer semantics, so version `3.18.0` can be found at `sourcegraph/server:3.18.0`. You can see the full list of tags on our [Docker Hub page](https://hub.docker.com/r/sourcegraph/server/tags).
-
-## Documentation
-
-Sourcegraph development is open source at [github.com/sourcegraph/sourcegraph](https://github.com/sourcegraph/sourcegraph). Need help? Use the [issue tracker](https://github.com/sourcegraph/sourcegraph/issues).
-
-### Core documentation
-
-- [**User documentation**](user/index.md)
-- [**Administrator documentation**](admin/index.md)
-- [Install Sourcegraph](admin/install/index.md) or [update Sourcegraph](admin/updates.md)
-- [Sourcegraph extensions](extensions/index.md)
-- [Product direction (roadmap)](https://about.sourcegraph.com/direction)
+- [Install](#getting-started) or [update](admin/updates.md) Sourcegraph
+- [Using Sourcegraph](getting-started/index.md)
+- [Administration](admin/index.md)
+- [Extensions](extensions/index.md)
 
 ### Features and tutorials
 
-- [Overview](user/index.md): What is Sourcegraph?
-- [Tour](user/tour.md): A walkthrough of Sourcegraph's features, with real-world example use cases.
+- [Tour](getting-started/tour.md): A walkthrough of Sourcegraph's features, with real-world example use cases.
 - [How to run a Sourcegraph trial](adopt/trial/index.md) at your company
 - [Integrations](integration/index.md) with GitHub, GitLab, Bitbucket, etc.
 - [Chrome and Firefox browser extensions](integration/browser_extension.md)
-- [Query syntax reference](user/search/queries.md)
+
+### Reference
+
+- [Query syntax reference](code_search/reference/queries.md)
 - [GraphQL API](api/graphql/index.md)
-- [Sourcegraph Enterprise](admin/subscriptions/index.md)
-
-## Sourcegraph subscriptions
-
-You can use Sourcegraph in 2 ways:
-
-- [Self-hosted Sourcegraph](admin/install/index.md): Deploy and manage your own Sourcegraph instance.
-- [Sourcegraph.com](https://sourcegraph.com): For public code only. No signup or installation required.
-
-For self-hosted Sourcegraph instances, you run a Docker image or Kubernetes cluster on-premises or on your preferred cloud provider. There are [2 tiers](https://about.sourcegraph.com/pricing): Core (free) and Enterprise. Enterprise features require a [Sourcegraph subscription](https://about.sourcegraph.com/contact/sales).
+- [Sourcegraph changelog](./CHANGELOG.md)
 
 ## Other links
 
-- [Sourcegraph open-source repository](https://github.com/sourcegraph/sourcegraph)
 - [Contributing to Sourcegraph](dev/index.md)
 - [Sourcegraph handbook](https://about.sourcegraph.com/handbook)
 - [Sourcegraph blog](https://about.sourcegraph.com/blog/)
-- [Issue tracker](https://github.com/sourcegraph/sourcegraph/issues)
-- [about.sourcegraph.com](https://about.sourcegraph.com) (general information about Sourcegraph)
-- [@srcgraph on Twitter](https://twitter.com/srcgraph)
+- [@sourcegraph on Twitter](https://twitter.com/sourcegraph)
+- [Product Roadmap](https://about.sourcegraph.com/direction)
+
+## Get help
+
+- [File an issue](https://github.com/sourcegraph/sourcegraph/issues/new?&title=Improve+Sourcegraph+quickstart+guide)
+- [Tweet (@sourcegraph)](https://twitter.com/sourcegraph)
+- [Talk to an engineer](https://info.sourcegraph.com/talk-to-a-developer)
+- [Talk to a product specialist](https://about.sourcegraph.com/contact/request-info/)
